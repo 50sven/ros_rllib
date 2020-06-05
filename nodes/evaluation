@@ -1,0 +1,417 @@
+#!/usr/bin/env python
+"""Online Evaluation Node
+
+This script provides a ROS Node that evaluates trainings runs.
+
+Class:
+    * EvalNode - ROS node for online evaluation
+"""
+import os
+import json
+import rospy
+import socket
+import importlib
+import numpy as np
+import torch
+from threading import Lock
+from torch.utils.tensorboard import SummaryWriter
+from carla_rllib.environments.carla_envs.config import BaseConfig
+from carla_rllib.environments.carla_envs.trajectory_env import make_env
+
+from ros_carla_rllib.srv import RunEvaluation
+from ros_carla_rllib.srv import RunEvaluationResponse
+from ros_carla_rllib.policies import ActorCritic
+
+
+class EvalNode(object):
+    """
+    Evaluation node to evaluate training runs.
+    """
+
+    def __init__(self):
+
+        self.initialized = False
+        self.env = None
+        self.policy = None
+        self.mutex = Lock()
+
+        # Statistics
+        self.eval_counter = 0
+        self.max_rew = -999.9
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        self.initialize_env()
+        self.initialize_policy()
+        self.initialize_service()
+        self.initialize_writer()
+
+        self.initialized = True
+        print("Node is running")
+
+    def initialize_node(self):
+        """ """
+        rospy.init_node('eval_node_' + socket.gethostname().split('-')[-1])
+        print('Evaluation Node on ' + socket.gethostname() + ' initialized')
+
+    def get_parameter_values(self):
+        """ """
+        # Environment Parameters
+        self.host = rospy.get_param('~host', "localhost")
+        self.port = rospy.get_param('~port', 6379)
+        self.map = rospy.get_param('~map', "Town06")
+        self.sync_mode = rospy.get_param('~sync_mode', True)
+        self.delta_sec = rospy.get_param('~delta_sec', 0.1)
+        self.scenario = rospy.get_param('~scenario', "")
+        self.frame_skip = rospy.get_param('~frame_skip', 0)
+        self.render = rospy.get_param('~render', False)
+        self.agent_type = rospy.get_param('~agent_type', "discrete")
+        self.reset_info = rospy.get_param('~reset_info', "")
+        # Trajectory Planning
+        self.deltaT = rospy.get_param('~deltaT', 1.0)
+        self.dt = rospy.get_param('~dt', 0.05)
+        self.fraction = rospy.get_param('~fraction', 0.25)
+        self.dV_amp = rospy.get_param('~dV_amp', 3.5)
+        self.dL_amp = rospy.get_param('~dL_amp', 1.75)
+        # Evaluation
+        self.coop_factor = rospy.get_param('~coop_factor', 0.0)
+        self.repetitions = rospy.get_param('~repetitions', 100)
+        self.policy_n = rospy.get_param('~policy', "gaussian")
+        self.model = rospy.get_param('~model', "")
+        self.save_path = rospy.get_param('~save_path', "")
+        self.verbose = rospy.get_param('~verbose', False)
+
+        # Service Parameter
+        self.eval_topic = rospy.get_param(
+            '~eval_topic', "evaluation/stats")
+
+    def initialize_env(self):
+        """Creates the CARLA environment"""
+        class Config:
+            pass
+        config = Config()
+        config.host = self.host
+        config.port = self.port
+        config.map = self.map
+        config.sync_mode = self.sync_mode
+        config.delta_sec = self.delta_sec
+        config.no_rendering_mode = not self.render
+        config.scenario = self.scenario
+        config.frame_skip = self.frame_skip
+        config.render = self.render
+        config.stable_baselines = False
+        config.agent_type = self.agent_type
+        config.coop_factor = self.coop_factor
+        config.camera_settings = {"enabled": False, "type_id": None}
+        with open(os.path.expanduser(self.reset_info), "r") as f:
+            self.reset_info = json.load(f)
+        config.reset_info = self.reset_info
+        config.eval = False
+        config.deltaT = self.deltaT
+        config.dt = self.dt
+        config.fraction = self.fraction
+        self.env = make_env(config)
+        print("Environment initialized")
+
+    def initialize_policy(self):
+        """Creates policy"""
+        self.policy = ActorCritic(self.model, self.policy_n)
+        print("Policy initialized")
+
+    def initialize_service(self):
+        """ """
+        self.evaluation_service = rospy.Service(
+            self.eval_topic, RunEvaluation, self.evaluate)
+
+        rospy.wait_for_service(self.eval_topic)
+        print('Service initialized')
+
+    def initialize_writer(self):
+        """ """
+        self.writer = SummaryWriter(os.path.expanduser(self.save_path),
+                                    purge_step=None)
+
+        print("Logger initialized")
+
+    def run_episode(self):
+        """Runs an evaluation episode in the CARLA environment
+
+        - Executes environment steps
+        - Collects evaluation statistics
+        """
+        print("----------Episode running----------")
+        # Buffers
+        actions = []
+        values = []
+        rewards = {agent.id: [] for agent in self.env.agents}
+        # Simulate environment while not terminal
+        frames = 0
+        terminal = False
+        obs_dict = self.env.reset()
+        while not terminal and not rospy.is_shutdown():
+
+            frames += 1
+
+            # Get actions
+            action_dict, value_dict = self.get_action(obs_dict)
+            # Execute environment step
+            next_obs_dict, reward_dict, done_dict, info_dict = self.env.step(
+                action_dict)
+            # Check if episode is done
+            if any(d != 0 for d in done_dict.values()):
+                if frames == 1:
+                    return None
+                terminal = True
+
+            # Store buffer items
+            actions += action_dict.values()
+            values += value_dict.values()
+            for agent_id, rew in reward_dict.items():
+                rewards[agent_id].append(rew)
+
+            if self.verbose:
+                print("Obs (Agent_1 ego): {} ".format(obs_dict["Agent_1"][1]))
+                print("Obs (others): {} ".format(obs_dict["Agent_1"][2]))
+                print("Actions: {}".format(["%s: [%.2f, %.2f]" % (k, v[0], v[1])
+                                            for k, v in action_dict.items()]))
+                print("Values: {}".format(["%s: %.2f" % (k, v)
+                                        for k, v in value_dict.items()]))
+                print("Rewards: {} ".format(["%s: %.2f" % (k, v)
+                                            for k, v in reward_dict.items()]))
+                print("-" * 10)
+            obs_dict = next_obs_dict
+
+        return (actions, values, frames, rewards)
+
+    def run_training(self):
+        """Keeps node running"""
+        print("Run trainings evaluation")
+        rospy.spin()
+
+    def evaluate(self, eval_req):
+        """Runs a evaluation online"""
+        with self.mutex:
+            # Update local policy
+            self.update_policy(eval_req)
+            # Run multiple evaluation episodes and log metrics
+            self.clear_statistics()
+            for world, scenarios in self.reset_info.items():
+
+                if rospy.is_shutdown():
+                    break
+
+                for scenario in scenarios.keys():
+                    self.env.switch_world(str(world), str(scenario))
+                    for episode in range(self.repetitions):
+                        # Run evaluation episode
+                        stat_buffers = None
+                        while stat_buffers is None:
+                            stat_buffers = self.run_episode()
+                        # Store episode statistics
+                        self.store_buffers(*stat_buffers)
+
+                        if rospy.is_shutdown():
+                            break
+
+                    if rospy.is_shutdown():
+                        break
+
+            self.eval_counter += 1
+            self.log_statistics()
+
+            # Save model
+            eval_ep_rew_per_frame = np.mean(self.episode_rewards) / np.mean(self.episode_frames)
+            if eval_ep_rew_per_frame > self.max_rew and self.eval_counter > 10:
+                self.max_rew = eval_ep_rew_per_frame
+                self.save_weights()
+
+        return RunEvaluationResponse()
+
+    def update_policy(self, eval_req):
+        """Updates local policy"""
+        # Decode weights
+        pi_weights, vf_weights = self.decode_weights(eval_req)
+        # Update policy
+        for param, tensor in zip(self.policy.pi.parameters(), pi_weights):
+            param.data.copy_(tensor)
+        for param, tensor in zip(self.policy.value_fn.parameters(), vf_weights):
+            param.data.copy_(tensor)
+
+        print("-" * 20)
+        print("Policy updated")
+        print("-" * 20)
+
+    def decode_weights(self, eval_req):
+        """Converts an evaluation request to weight tensors"""
+        pi_weights, vf_weights = [], []
+        for pi_layer in eval_req.pi_weights:
+            pi_tensor = self.build_tensor(pi_layer)
+            pi_weights.append(pi_tensor)
+        for vf_layer in eval_req.vf_weights:
+            vf_tensor = self.build_tensor(vf_layer)
+            vf_weights.append(vf_tensor)
+        return pi_weights, vf_weights
+
+    def build_tensor(self, layer):
+        """Converts Tensor messages to torch.Tensors"""
+        tensor_list = torch.Tensor(layer.tensor)
+        shape = list(layer.shape)
+        tensor = torch.reshape(tensor_list, shape)
+        return tensor
+
+    def get_action(self, obs_dict):
+        """Returns action and state value"""
+        action_dict = dict()
+        value_dict = dict()
+        for agent in self.env.agents:
+            # Preprocess observations
+            obs = obs_dict[agent.id]
+            obs_tensor = self.preprocess_obs(obs)
+            # Predict (deterministic) action and state value
+            action, value = self.policy.act(obs_tensor)
+            # Clip action to valid range
+            if self.policy_n == "gaussian":
+                deltaV = np.clip(action, -self.dV_amp, self.dV_amp)[0][0]
+                deltaD = np.clip(action, -self.dL_amp, self.dL_amp)[0][1]
+            elif self.policy_n == "beta":
+                deltaV = -self.dV_amp + (2 * self.dV_amp) * action[0][0]
+                deltaD = -self.dL_amp + (2 * self.dL_amp) * action[0][1]
+            action_dict[agent.id] = [deltaV, deltaD]
+            value_dict[agent.id] = value
+
+        return action_dict, value_dict
+
+    def preprocess_obs(self, obs):
+        """Transforms observations into torch.Tensors"""
+        # Add batch dimensions
+        xV = np.expand_dims(obs[0], 0)
+        xE = [obs[1]]
+        xO = np.expand_dims(obs[2], 0)
+        xO = xO - np.zeros_like(xO)
+
+        # All: Convert arrays to torch.Tensor
+        obs_tensors = []
+        obs_tensors.append(torch.from_numpy(xV).float())
+        obs_tensors.append(torch.Tensor(xE).float())
+        obs_tensors.append(torch.from_numpy(xO).float())
+
+        return obs_tensors
+
+    def store_buffers(self, actions, values, frames, reward_dict):
+        """Stores episode statistics"""
+        self.actions += actions
+        self.values += values
+        self.episode_frames.append(frames)
+        for agent in self.env.agents:
+            ep_rew = np.sum(reward_dict[agent.id])
+            self.episode_rewards.append(ep_rew)
+
+        print("-" * 20)
+        print("Episode statistics:")
+        print("Frames: {}".format(frames))
+        print("Rewards: {}".format(
+            ["%s: %.2f" % (k, np.sum(v)) for k, v in reward_dict.items()]))
+        print("-" * 20)
+
+    def clear_statistics(self):
+        """Clears the latest evaluation statistics"""
+        self.actions = []
+        self.values = []
+        self.episode_frames = []
+        self.episode_rewards = []
+
+    def log_statistics(self):
+        """Writes to tensorboard file"""
+
+        # Evaluation Episodes
+        mean_frames = np.mean(self.episode_frames)
+        std_frames = np.std(self.episode_frames)
+        self.writer.add_scalar("Evaluation/Episodes/Frames_Mean",
+                               mean_frames,
+                               self.eval_counter)
+        self.writer.add_scalar("Evaluation/Episodes/Frames_Std",
+                               std_frames,
+                               self.eval_counter)
+        self.writer.add_histogram("Evaluation/Episodes/Frames",
+                                  np.array(self.episode_frames),
+                                  self.eval_counter)
+        mean_reward = np.mean(self.episode_rewards)
+        std_reward = np.std(self.episode_rewards)
+        rews_per_frame = np.array(self.episode_rewards) / np.array(self.episode_frames, dtype=np.float)
+        self.writer.add_scalar("Evaluation/Episodes/Reward_Mean",
+                               mean_reward,
+                               self.eval_counter)
+        self.writer.add_scalar("Evaluation/Episodes/Reward_per_Frame_Mean",
+                               np.mean(rews_per_frame),
+                               self.eval_counter)
+        self.writer.add_scalar("Evaluation/Episodes/Reward_per_Frame_Std",
+                               np.std(rews_per_frame),
+                               self.eval_counter)
+        self.writer.add_scalar("Evaluation/Episodes/Reward_Std",
+                               std_reward,
+                               self.eval_counter)
+        self.writer.add_histogram("Evaluation/Episodes/Rewards",
+                                  np.array(self.episode_rewards),
+                                  self.eval_counter)
+        self.writer.add_histogram("Evaluation/Episodes/Rewards_per_Frame",
+                                  rews_per_frame,
+                                  self.eval_counter)
+        # Actions
+        actions = np.array(self.actions)
+        self.writer.add_histogram("Evaluation/Action/DeltaVel",
+                                  actions[:, 0],
+                                  self.eval_counter)
+        self.writer.add_histogram("Evaluation/Action/DeltaLat",
+                                  actions[:, 1],
+                                  self.eval_counter)
+        # Values
+        self.writer.add_histogram("Evaluation/Values",
+                                  np.array(self.values),
+                                  self.eval_counter)
+
+        self.writer.flush()
+
+        print("-" * 30)
+        print("Evaluation Run {}:".format(self.eval_counter))
+        print("Mean_Frames: {0:.2f}\t".format(mean_frames) +
+              "Std_Frames: {0:.2f}".format(std_frames))
+        print("Mean_Reward: {0:.2f}\t".format(mean_reward) +
+              "Std_Reward: {0:.2f}".format(std_reward))
+        print("Mean_Reward_per_frame: {0:.2f}\t".format(np.mean(rews_per_frame)) +
+              "Std_Reward_per_frame: {0:.2f}".format(np.std(rews_per_frame)))
+        print("-" * 30)
+
+    def save_weights(self, file_name="best_checkpoint"):
+        """Saves model parameters"""
+        path = os.path.expanduser(os.path.join(
+            self.save_path, file_name + ".pt"))
+        torch.save({"counter": self.eval_counter,
+                    "pi": self.policy.pi.state_dict(),
+                    "vf": self.policy.value_fn.state_dict()}, path)
+
+    def is_initialized(self):
+        """ """
+        return self.initialized
+
+    def quit(self):
+        """Closes the environment"""
+        try:
+            self.writer.close()
+        except:
+            pass
+        try:
+            self.env.close()
+        except:
+            pass
+        print('Evaluation Node quited')
+
+
+if __name__ == '__main__':
+
+    node = EvalNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            node.run_training()
+    finally:
+        node.quit()

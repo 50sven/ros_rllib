@@ -1,0 +1,448 @@
+#!/usr/bin/env python
+"""PPO Environment Node
+
+This script provides a ROS Node that run the policy to get training data.
+
+Class:
+    * EnvNode - ROS node running the environment to get rollout data
+"""
+import os
+import json
+import time
+import rospy
+import socket
+import importlib
+import numpy as np
+import torch
+from carla_rllib.environments.carla_envs.config import BaseConfig
+from carla_rllib.environments.carla_envs.trajectory_env import make_env
+
+from ros_carla_rllib.msg import Observation, Action, Rollout
+from ros_carla_rllib.srv import GetWeights
+from ros_carla_rllib.srv import GetWeightsRequest
+from ros_carla_rllib.srv import GetState
+from ros_carla_rllib.srv import GetStateRequest
+from ros_carla_rllib.policies import ActorCritic
+
+
+class EnvNode(object):
+    """
+    Environment node to run the simulation for the Proximal Policy Optimization
+    """
+
+    def __init__(self):
+
+        self.initialized = False
+        self.env = None
+        self.policy = None
+        self.update_underway = False
+
+        # Buffers
+        self.rollouts = {}
+        self.frames = 0
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        self.initialize_env()
+        self.initialize_policy()
+        self.initialize_publisher()
+        self.initialize_services()
+
+        time.sleep(1)
+        self.initialized = True
+        print("Node is running")
+
+    def initialize_node(self):
+        """ """
+        rospy.init_node('env_' + socket.gethostname().split('-')[-1])
+        self.env_id = rospy.get_name().replace("/", "")
+
+    def get_parameter_values(self):
+        """ """
+        # Environment Parameters
+        self.host = rospy.get_param('~host', "localhost")
+        self.port = rospy.get_param('~port', 6379)
+        self.map = rospy.get_param('~map', "Town06")
+        self.sync_mode = rospy.get_param('~sync_mode', True)
+        self.delta_sec = rospy.get_param('~delta_sec', 0.1)
+        self.scenario = rospy.get_param('~scenario', "")
+        self.scenario = self.map if not self.scenario else self.scenario
+        self.frame_skip = rospy.get_param('~frame_skip', 0)
+        self.render = rospy.get_param('~render', False)
+        self.agent_type = rospy.get_param('~agent_type', "discrete")
+        self.reset_info = rospy.get_param('~reset_info', "")
+        # Trajectory Planning
+        self.deltaT = rospy.get_param('~deltaT', 1.0)
+        self.dt = rospy.get_param('~dt', 0.05)
+        self.fraction = rospy.get_param('~fraction', 0.25)
+        self.dV_amp = rospy.get_param('~dV_amp', 3.5)
+        self.dL_amp = rospy.get_param('~dL_amp', 1.75)
+        # Training Parameters
+        self.lambda_ = rospy.get_param('~lambda', 0.95)
+        self.gamma = rospy.get_param('~gamma', 0.99)
+        self.coop_factor = rospy.get_param('~coop_factor', 0.99)
+        self.policy_n = rospy.get_param('~policy', "gaussian")
+        self.model = rospy.get_param('~model', "")
+        self.verbose = rospy.get_param('~verbose', False)
+
+        # Service Parameter
+        self.weights_topic = rospy.get_param(
+            '~weights_topic', "master/weights")
+        self.state_topic = rospy.get_param(
+            '~state_topic', "master/state")
+
+        # Publisher Parameter
+        self.rollouts_topic = rospy.get_param(
+            '~rollouts_topic', "env/rollouts")
+
+        print('Parameters requested')
+
+    def initialize_services(self):
+        """ """
+        self.weights_service = rospy.ServiceProxy(
+            self.weights_topic, GetWeights)
+        rospy.wait_for_service(self.weights_topic)
+
+        self.state_service = rospy.ServiceProxy(
+            self.state_topic, GetState)
+        rospy.wait_for_service(self.state_topic)
+
+        print('Service initialized')
+
+    def initialize_publisher(self):
+        """ """
+        self.rollout_publisher = rospy.Publisher(
+            self.rollouts_topic, Rollout, queue_size=4)
+        print('Publisher initialized')
+
+    def initialize_env(self):
+        """Creates the CARLA environment"""
+        class Config:
+            pass
+        config = Config()
+        config.host = self.host
+        config.port = self.port
+        config.map = self.map
+        config.sync_mode = self.sync_mode
+        config.delta_sec = self.delta_sec
+        config.no_rendering_mode = not self.render
+        config.scenario = self.scenario
+        config.frame_skip = self.frame_skip
+        config.render = self.render
+        config.stable_baselines = False
+        config.agent_type = self.agent_type
+        config.coop_factor = self.coop_factor
+        config.camera_settings = {"enabled": False, "type_id": None}
+        with open(os.path.expanduser(self.reset_info), "r") as f:
+            self.reset_info = json.load(f)
+        config.reset_info = self.reset_info
+        config.eval = False
+        config.deltaT = self.deltaT
+        config.dt = self.dt
+        config.fraction = self.fraction
+        self.env = make_env(config)
+
+        print("Environment initialized")
+
+    def initialize_policy(self):
+        """ """
+        self.policy = ActorCritic(self.model, self.policy_n)
+        print("Policy initialized")
+
+    def run_training(self):
+        """Runs the environment to collect trainings data
+
+        - Collects rollouts and sends them to the master
+        - Calls the weight service to update the local policy
+        """
+        # Initialize policy
+        print("Request weights for initialization")
+        self.update_policy()
+
+        while not rospy.is_shutdown():
+
+            # Retrieve state from master and update env accordingly
+            world, scenario = self.get_state()
+            if (self.map != world or self.scenario != scenario):
+                self.map = world
+                self.scenario = scenario
+                self.env.switch_world(self.map, self.scenario)
+            # Run one episode and send rollout data
+            if not self.update_underway:
+                success = False
+                while not success:
+                    success = self.run_episode()
+                self.send_rollouts()
+            # Wait until update is finished and request weights to update local policy
+            else:
+                wait_for_update = True
+                while wait_for_update:
+                    wait_for_update = self.update_policy()
+                    time.sleep(2.0)
+
+    def update_policy(self):
+        """Updates local policy by requesting weights from the master"""
+        # Receive weights or empty response
+        weights_rsp = self.weights_service(GetWeightsRequest(self.env_id))
+
+        # If response is empty keep waiting
+        if not weights_rsp.pi_weights:
+            return True
+        # If response contains weights, update policy
+        else:
+            # Decode weights
+            pi_weights, vf_weights = self.decode_weights(weights_rsp)
+            # Update policy
+            for param, tensor in zip(self.policy.pi.parameters(), pi_weights):
+                param.data.copy_(tensor)
+            for param, tensor in zip(self.policy.value_fn.parameters(), vf_weights):
+                param.data.copy_(tensor)
+
+            print("-" * 10 + "\nPolicy updated\n" + "-" * 10)
+
+            return False
+
+    def decode_weights(self, weights_rsp):
+        """Converts a weight response to weight tensors"""
+        pi_weights, vf_weights = [], []
+        for pi_layer in weights_rsp.pi_weights:
+            pi_tensor = self.build_tensor(pi_layer)
+            pi_weights.append(pi_tensor)
+        for vf_layer in weights_rsp.vf_weights:
+            vf_tensor = self.build_tensor(vf_layer)
+            vf_weights.append(vf_tensor)
+        return pi_weights, vf_weights
+
+    def build_tensor(self, layer):
+        """Converts Tensor messages to torch.Tensors"""
+        tensor_list = torch.Tensor(layer.tensor)
+        shape = list(layer.shape)
+        tensor = torch.reshape(tensor_list, shape)
+        return tensor
+
+    def run_episode(self):
+        """Runs an episode in the CARLA environment
+
+        - Executes environment steps
+        - Calculates the returns and advantages after an epsiode has finished
+        """
+        print("----------Episode running----------")
+        # Clear buffers
+        self.clear_buffers()
+
+        # Simulate environment while not terminal
+        terminal = False
+        obs_dict = self.env.reset()
+        while not terminal and not rospy.is_shutdown():
+
+            self.frames += 1
+
+            # Sample actions
+            sample_dict, action_dict, logp_dict, value_dict = self.sample_action(
+                obs_dict)
+            # Execute environment step
+            next_obs_dict, reward_dict, done_dict, info_dict = self.env.step(
+                action_dict)
+            # Store trajectory samples
+            self.store_samples(obs_dict, sample_dict, logp_dict,
+                               value_dict, reward_dict)
+            # Check if episode is done
+            if any(d != 0 for d in done_dict.values()):
+                if self.frames == 1:
+                    return False
+                terminal = True
+
+            if self.verbose:
+                print("Obs (Agent_1 ego): {} ".format(obs_dict["Agent_1"][1]))
+                print("Obs (others): {} ".format(obs_dict["Agent_1"][2]))
+                print("Actions: {}".format(["%s: [%.2f, %.2f]" % (k, v[0], v[1])
+                                            for k, v in action_dict.items()]))
+                print("Values: {}".format(["%s: %.2f" % (k, v)
+                                        for k, v in value_dict.items()]))
+                print("Rewards: {} ".format(["%s: %.2f" % (k, v)
+                                            for k, v in reward_dict.items()]))
+                print("-" * 10)
+            obs_dict = next_obs_dict
+
+        # Calculate returns and advantages
+        self.finish_rollouts(next_obs_dict, done_dict)
+
+        return True
+
+    def sample_action(self, obs_dict):
+        """Performs action sampling and state value prediction"""
+        sample_dict = dict()
+        action_dict = dict()
+        logp_dict = dict()
+        value_dict = dict()
+        for agent in self.env.agents:
+
+            # Preprocess observations
+            obs = obs_dict[agent.id]
+            obs_tensor = self.preprocess_obs(obs)
+            # Run policy
+            sample, logp, value = self.policy.sample(obs_tensor)
+            # Clip action to valid range
+            if self.policy_n == "gaussian":
+                deltaV = np.clip(sample, -self.dV_amp, self.dV_amp)[0][0]
+                deltaD = np.clip(sample, -self.dL_amp, self.dL_amp)[0][1]
+            elif self.policy_n == "beta":
+                deltaV = -self.dV_amp + (2 * self.dV_amp) * sample[0][0]
+                deltaD = -self.dL_amp + (2 * self.dL_amp) * sample[0][1]
+
+            sample_dict[agent.id] = [sample[0][0], sample[0][1]]
+            action_dict[agent.id] = [deltaV, deltaD]
+            logp_dict[agent.id] = logp
+            value_dict[agent.id] = value
+
+        return sample_dict, action_dict, logp_dict, value_dict
+
+    def store_samples(self, obs_dict, sample_dict, logp_dict, value_dict, reward_dict):
+        """Stores rollout data"""
+        for agent in self.env.agents:
+            # Observation
+            obs = self.get_obs_msg(obs_dict[agent.id])
+            # Action
+            act = Action()
+            act.action = sample_dict[agent.id]
+            act.logp = logp_dict[agent.id]
+            # Rollout
+            rollout = self.rollouts[agent.id]
+            rollout.observations.append(obs)
+            rollout.actions.append(act)
+            rollout.values.append(value_dict[agent.id])
+            rollout.rewards.append(reward_dict[agent.id])
+
+    def finish_rollouts(self, next_obs_dict, done_dict):
+        """Calculates returns and advantages"""
+        for agent_id, rollout in self.rollouts.items():
+            # Get terminal value
+            if done_dict[agent_id] == 1:
+                prev_value = 0.0
+            else:
+                next_obs = self.preprocess_obs(next_obs_dict[agent_id])
+                prev_value = self.policy.value_fn(next_obs).item()
+
+            returns = []
+            advantages = []
+
+            # Baseline: Rewards-to-go and GAE
+            prev_return = prev_value
+            prev_adv = 0.0
+            for reward, value in zip(rollout.rewards[::-1], rollout.values[::-1]):
+                return_ = reward + self.gamma * prev_return
+                delta = reward + self.gamma * prev_value - value
+                adv = delta + self.gamma * self.lambda_ * prev_adv
+
+                returns.append(return_)
+                advantages.append(adv)
+                prev_return = return_
+                prev_value = value
+                prev_adv = adv
+
+            # Rewards-to-go
+            # prev_return = prev_value
+            # for reward, value in zip(rollout.rewards[::-1], rollout.values[::-1]):
+            #     return_ = reward + self.gamma * prev_return
+            #     adv = return_ - value
+
+            #     returns.append(return_)
+            #     advantages.append(adv)
+            #     prev_return = return_
+
+            # General Advantage Estimation
+            # prev_adv = 0.0
+            # for reward, value in zip(rollout.rewards[::-1], rollout.values[::-1]):
+
+            #     delta = reward + self.gamma * prev_value - value
+            #     adv = delta + self.gamma * self.lambda_ * prev_adv
+            #     return_ = adv + value
+
+            #     returns.append(return_)
+            #     advantages.append(adv)
+            #     prev_value = value
+            #     prev_adv = adv
+
+            rollout.returns = returns[::-1]
+            rollout.advantages = advantages[::-1]
+            rollout.episode_length = self.frames
+            rollout.world = self.map
+            rollout.scenario = self.scenario
+
+    def send_rollouts(self):
+        """ """
+        for agent in self.env.agents:
+            rollout = self.rollouts[agent.id]
+            self.rollout_publisher.publish(rollout)
+
+        if self.verbose:
+            print("-" * 10 + "\nRollouts sent to master\n" + "-" * 10)
+
+    def get_state(self):
+        """Retrieves the state of the master node"""
+        state_rsp = self.state_service(GetStateRequest(self.env_id))
+        self.update_underway = state_rsp.update_underway
+
+        return state_rsp.world, state_rsp.scenario
+
+    def get_obs_msg(self, obs):
+        """Creates the observation message"""
+        ego_vis = obs[0].flatten().tolist()
+        ego_vec = obs[1]
+        try:
+            other_vec = obs[2].flatten()
+        except:
+            other_vec = obs[2]
+
+        obs_msg = Observation()
+        obs_msg.ego_visual = ego_vis
+        obs_msg.ego_visual_shape = list(obs[0].shape)
+        obs_msg.ego_vector = ego_vec
+        obs_msg.other_vectors = other_vec
+        obs_msg.num_agents = self.env.num_agents - 1
+
+        return obs_msg
+
+    def preprocess_obs(self, obs):
+        """Transforms observations into torch.Tensors"""
+        # Add batch dimensions
+        xV = np.expand_dims(obs[0], 0)
+        xE = [obs[1]]
+        xO = np.expand_dims(obs[2], 0)
+        xO = xO - np.zeros_like(xO)
+
+        # All: Convert arrays to torch.Tensor
+        obs_tensors = []
+        obs_tensors.append(torch.from_numpy(xV).float())
+        obs_tensors.append(torch.Tensor(xE).float())
+        obs_tensors.append(torch.from_numpy(xO).float())
+
+        return obs_tensors
+
+    def clear_buffers(self):
+        """Clears the episode buffers"""
+        self.rollouts = {agent.id: Rollout() for agent in self.env.agents}
+        self.frames = 0
+
+    def is_initialized(self):
+        """ """
+        return self.initialized
+
+    def quit(self):
+        """Closes the environment"""
+        try:
+            self.env.close()
+        except:
+            pass
+        print('Environment Node quited')
+
+
+if __name__ == '__main__':
+
+    node = EnvNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            node.run_training()
+    finally:
+        node.quit()

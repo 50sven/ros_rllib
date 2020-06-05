@@ -1,0 +1,11 @@
+# State service to organize sampling process
+
+# Request
+string env_id               # name of the environment node
+
+---
+
+# Response
+bool update_underway        # if the master is updating
+string world                # world to be loaded
+string scenario             # scenario to be executeed

@@ -1,0 +1,613 @@
+#!/usr/bin/env python
+"""A3C Environment Node
+
+This script provides a ROS Node that executes simulator steps
+and calculates gradients for the A3C algorithm
+
+Class:
+    * EnvNode - ROS node running the environment and calculating gradients
+"""
+import os
+import json
+import time
+import rospy
+import socket
+import importlib
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import MultivariateNormal
+from carla_rllib.environments.carla_envs.config import BaseConfig
+from carla_rllib.environments.carla_envs.trajectory_env import make_env
+from carla_rllib.utils.trajectory_planning import PolynomialGenerator
+
+from ros_carla_rllib.msg import Tensor
+from ros_carla_rllib.msg import Gradient
+from ros_carla_rllib.srv import UpdateGlobalPolicy
+from ros_carla_rllib.srv import UpdateGlobalPolicyRequest
+from ros_carla_rllib.srv import GetWeights
+from ros_carla_rllib.srv import GetWeightsRequest
+from ros_carla_rllib.memories import A3CMemory
+
+
+class EnvNode(object):
+    """
+    Environment node to start running the simulation.
+    Gradient computation is also executed on this class.
+    """
+
+    def __init__(self):
+
+        self.initialized = False
+        self.env = None
+        self.policies = {}
+        self.memories = {}
+        self.cov = [2.0, 1.5]
+
+        # Logging buffers
+        self.pg_loss_buffer = {}
+        self.entropy_buffer = {}
+        self.vf_loss_buffer = {}
+        self.total_loss_buffer = {}
+        self.reward_buffer = {}
+        self.frames_buffer = 0
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        if not self.evaluate:
+            self.initialize_services()
+        self.initialize_env()
+        self.initialize_policies()
+        self.initialize_buffers()
+
+        time.sleep(1)
+        print("Node is running")
+
+    def initialize_node(self):
+        """Registers the node"""
+        rospy.init_node('env_' + socket.gethostname().split('-')[-1])
+        self.env_id = rospy.get_name().replace("/", "")
+
+    def get_parameter_values(self):
+        """Fetches the parameters"""
+        # Environment Parameters
+        self.host = rospy.get_param('~host', "localhost")
+        self.port = rospy.get_param('~port', 6379)
+        self.map = rospy.get_param('~map', "Town05")
+        self.sync_mode = rospy.get_param('~sync_mode', True)
+        self.delta_sec = rospy.get_param('~delta_sec', 0.1)
+        self.scenario = rospy.get_param('~scenario', "")
+        self.scenario = self.map if not self.scenario else self.scenario
+        self.frame_skip = rospy.get_param('~frame_skip', 0)
+        self.render = rospy.get_param('~render', False)
+        self.num_agents = rospy.get_param('~num_agents', 2)
+        self.agent_type = rospy.get_param('~agent_type', "discrete")
+        self.reset_info = rospy.get_param('~reset_info', "")
+
+        # Training Parameters
+        self.n_step_update = rospy.get_param('~n_step_update', True)
+        self.n_step = rospy.get_param('~n_step', 5)
+        self.alpha = rospy.get_param('~alpha', 0.5)
+        self.beta = rospy.get_param('~beta', 0.0001)
+        self.gamma = rospy.get_param('~gamma', 0.99)
+        self.model = rospy.get_param('~model', "HybridModel")
+        self.gpu = rospy.get_param('~gpu', True)
+        self.device = torch.device("cuda") if (
+            torch.cuda.is_available() and self.gpu) else torch.device("cpu")
+
+        # Evaluation
+        self.evaluate = rospy.get_param('~evaluate', False)
+        self.evaluate_with_sigma = rospy.get_param('~evaluate_with_sigma', 0.0)
+        self.repetitions = rospy.get_param('~repetitions', 100)
+        self.checkpoint = rospy.get_param('~checkpoint', "")
+
+        # Service Parameter
+        self.update_policy_topic = rospy.get_param(
+            '~update_policy_topic', "master/update_policy")
+        self.request_weights_topic = rospy.get_param(
+            '~request_weights_topic', "master/request_weights")
+
+        print('Parameters requested')
+
+    def initialize_services(self):
+        """Creates services to send gradients and request weights"""
+        self.update_policy_service = rospy.ServiceProxy(
+            self.update_policy_topic, UpdateGlobalPolicy)
+        self.request_weights_service = rospy.ServiceProxy(
+            self.request_weights_topic, GetWeights)
+
+        rospy.wait_for_service(self.update_policy_topic)
+        rospy.wait_for_service(self.request_weights_topic)
+        print('Services initialized')
+
+    def initialize_env(self):
+        """Creates the CARLA environment"""
+        class Config:
+            pass
+        config = Config()
+        config.host = self.host
+        config.port = self.port
+        config.map = self.map
+        config.sync_mode = self.sync_mode
+        config.delta_sec = self.delta_sec
+        config.scenario = self.scenario
+        config.frame_skip = self.frame_skip
+        config.render = self.render
+        config.stable_baselines = False
+        config.num_agents = self.num_agents
+        config.agent_type = self.agent_type
+        config.camera_settings = {"enabled": False, "type_id": None}
+        with open(os.path.expanduser(self.reset_info), "r") as f:
+            self.reset_info = json.load(f)
+        config.reset_info = self.reset_info[self.scenario]
+        self.env = make_env(config)
+        self.generator = PolynomialGenerator(deltaT=1.4, dt=0.05, fraction=0.5)
+
+        print("Environment initialized")
+
+    def initialize_policies(self):
+        """Creates the local (dueling) policy networks"""
+        self.policies = {}
+        self.memories = {}
+
+        module = importlib.import_module("ros_carla_rllib.models")
+
+        for agent in self.env.agents:
+            model = getattr(module, self.model)()
+            self.policies[agent.id] = model.to(self.device)
+            self.memories[agent.id] = A3CMemory()
+
+        self.dist = MultivariateNormal
+
+        print("Policies initialized")
+
+    def initialize_buffers(self):
+        """Creates the episode buffers"""
+        for agent_id in self.policies.keys():
+            self.pg_loss_buffer[agent_id] = []
+            self.entropy_buffer[agent_id] = []
+            self.vf_loss_buffer[agent_id] = []
+            self.total_loss_buffer[agent_id] = []
+            self.reward_buffer[agent_id] = []
+
+        self.frames_buffer = 0
+
+        self.initialized = True
+        print("Buffers initialized")
+
+    def run_evaluation(self):
+        """Runs the node in evaluation mode"""
+        # Load checkpoint weights
+        path = os.path.expanduser(self.checkpoint)
+        for policy in self.policies.values():
+            policy.load_state_dict(torch.load(path))
+            policy.eval()
+        print("Checkpoint loaded: " + path)
+
+        print("Run Evaluation")
+        for _ in range(self.repetitions):
+
+            if rospy.is_shutdown():
+                break
+
+            self.clear_episode()
+            obs_dict = self.env.reset()
+            terminal = False
+
+            while not terminal and not rospy.is_shutdown():
+
+                self.frames_buffer += 1
+
+                print("Obs (ego): {} ".format(obs_dict["Agent_1"][1]))
+                print("Obs (other): {} ".format(obs_dict["Agent_1"][2]))
+
+                # Get actions and values
+                with torch.no_grad():
+                    action_dict, value_dict = self.get_actions(obs_dict)
+
+                # Calculate trajectories
+                traj_dict = self.get_trajectory(action_dict)
+
+                # Execute environment step
+                next_obs_dict, reward_dict, done_dict, info_dict = self.env.step(
+                    traj_dict)
+                obs_dict = next_obs_dict
+
+                print("Reward: {0:.2f} ".format(reward_dict["Agent_1"]))
+                print("-" * 10)
+
+                # Fill buffers
+                for agent_id in self.policies.keys():
+                    self.reward_buffer[agent_id].append(reward_dict[agent_id])
+
+                # Check if episode is done
+                if any(d != 0 for d in done_dict.values()):
+                    terminal = True
+
+            print("Episode frames: {} ".format(self.frames_buffer) +
+                  "Episode reward: {0:.2f} ".format(np.sum(self.reward_buffer["Agent_1"])))
+            print("-" * 20)
+
+    def run_training(self):
+        """Runs the environment and calculates gradients
+
+        - Executes n-steps in the environment and accumulates gradients
+        - Calls the update service to send gradients and receive weights
+
+        if n-step update: sends gradients after each n-step
+        else: sends gradients after each episode
+        """
+        # Initialize weights
+        print("Request weights for initialization")
+        weights_rsp = self.request_weights_service(
+            GetWeightsRequest(self.env_id))
+        self.update_policies(weights_rsp.policy_weights)
+
+        print("Run Training")
+        while not rospy.is_shutdown():
+
+            if self.n_step_update:
+                _, info_dict = self.run_episode()
+            else:
+                # Run one episode
+                gradients_req, info_dict = self.run_episode()
+
+                # Send gradients and receive weights
+                weights_rsp = self.update_policy_service(gradients_req)
+
+                # Update policies
+                self.update_policies(weights_rsp.weights)
+
+                # Update covariance
+                self.cov = weights_rsp.covariance
+
+    def update_policies(self, policy_weights):
+        """Updates local policy network"""
+        # Decode weights
+        weights = self.decode_weights(policy_weights)
+
+        # Update policies
+        for policy in self.policies.values():
+            for param, tensor in zip(policy.parameters(), weights):
+                param.data.copy_(tensor)
+
+    def decode_weights(self, policy_weights):
+        """Converts a weight list to weight tensors"""
+        weights = []
+        for layer in policy_weights:
+            tensor_list = torch.Tensor(layer.tensor)
+            shape = list(layer.shape)
+            tensor = torch.reshape(tensor_list, shape)
+            weights.append(tensor)
+        return weights
+
+    def run_episode(self):
+        """Runs an episode in the CARLA environment
+
+        - Executes environment steps
+        - Accumulates gradients (and sends gradients)
+
+        if n-step update: accumulates and sends gradients after each n-step
+        else: accumulates gradients for the whole episode
+        """
+        # Clear buffers
+        self.clear_episode()
+
+        # Simulate environment while not terminal
+        terminal = False
+        t = 1
+        obs_dict = self.env.reset()
+
+        while not terminal and not rospy.is_shutdown():
+
+            # Clear memories
+            self.clear_memories()
+
+            # N-step simulation
+            t_last = t
+            while t - t_last < self.n_step and not terminal and not rospy.is_shutdown():
+
+                self.frames_buffer += 1
+
+                print("Obs (ego): {} ".format(obs_dict["Agent_1"][1]))
+                print("Obs (other): {} ".format(obs_dict["Agent_1"][2]))
+
+                # Sample actions
+                action_dict, log_prob_dict, entropy_dict, value_dict = self.sample_actions(
+                    obs_dict)
+
+                # Calculate trajectories
+                traj_dict = self.get_trajectory(action_dict)
+
+                # Execute environment step
+                next_obs_dict, reward_dict, done_dict, info_dict = self.env.step(
+                    traj_dict)
+
+                print("Reward: {0:.2f} ".format(reward_dict["Agent_1"]))
+
+                # Store n-step history
+                self.store_values(log_prob_dict, entropy_dict,
+                                  value_dict, reward_dict)
+                obs_dict = next_obs_dict
+
+                # Check if episode is done
+                if any(d != 0 for d in done_dict.values()):
+                    terminal = True
+
+                t += 1
+                print("-" * 10)
+
+            print("-" * 20)
+
+            # Accumulate gradients
+            self.accumulate_gradients(obs_dict, done_dict)
+
+            if self.n_step_update:
+                # Prepare gradients req
+                gradients_req = self.get_gradients()
+                # Send gradients and receive weights
+                weights_rsp = self.update_policy_service(gradients_req)
+                # Update policies
+                self.update_policies(weights_rsp.weights)
+                # Update covariance
+                self.cov = weights_rsp.covariance
+                # Clear buffers
+                self.clear_episode()
+
+        if not self.n_step_update:
+            gradients_req = self.get_gradients()
+        else:
+            gradients_req = None
+
+        return gradients_req, info_dict
+
+    def sample_actions(self, obs_dict):
+        """Performs action sampling and value prediction"""
+        action_dict = dict()
+        log_prob_dict = dict()
+        entropy_dict = dict()
+        value_dict = dict()
+        for agent_id, policy in self.policies.items():
+
+            # Preprocess observations
+            obs = obs_dict[agent_id]
+            obs_tensor = self.preprocess_obs(obs)
+
+            # Sample action
+            # loc, cov, value = policy(obs_tensor)
+            loc, value = policy(obs_tensor)
+            # d = self.dist(loc, torch.diag(cov[0]))
+            cov = torch.diag(torch.tensor(self.cov)).to(self.device)
+            d = self.dist(loc, cov)
+            action = d.sample()
+
+            # Return action, log prob, entropy and value
+            deltaV = torch.clamp(action, -5.0, 5.0)[0][0].item()
+            deltaD = torch.clamp(action, -2.0, 2.0)[0][1].item()
+            action_dict[agent_id] = [deltaV, deltaD]
+            log_prob_dict[agent_id] = d.log_prob(action)
+            entropy_dict[agent_id] = d.entropy()
+            value_dict[agent_id] = value
+
+            if agent_id == "Agent_1":
+                print("Loc: {} ".format(["%.2f" % v for v in loc[0]]) +
+                      #   "Cov: {} ".format(["%.2f" % v for v in cov[0]]) +
+                      "Cov: {} ".format(["%.2f" % v for v in self.cov]) +
+                      "Sample: {} ".format(["%.2f" % v for v in action_dict[agent_id]]) +
+                      "Entropy: {0:.2f} ".format(entropy_dict[agent_id].item()) +
+                      "Value: {0:.2f}".format(value_dict[agent_id].item())
+                      )
+
+        return action_dict, log_prob_dict, entropy_dict, value_dict
+
+    def get_actions(self, obs_dict):
+        """Performs action and value prediction"""
+        action_dict = dict()
+        value_dict = dict()
+        for agent_id, policy in self.policies.items():
+
+            # Preprocess observations
+            obs = obs_dict[agent_id]
+            obs_tensor = self.preprocess_obs(obs)
+
+            # Predict action (deterministic)
+            # loc, cov, value = policy(obs_tensor)
+            loc, value = policy(obs_tensor)
+
+            # Return action and value
+            deltaV = torch.clamp(loc, -5.0, 5.0)[0][0].item()
+            deltaD = torch.clamp(loc, -2.0, 2.0)[0][1].item()
+            action_dict[agent_id] = [deltaV, deltaD]
+            value_dict[agent_id] = value.item()
+
+            if agent_id == "Agent_1":
+                print("Loc: {} ".format(["%.2f" % v for v in loc[0]]) +
+                      "Value: {0:.2f}".format(value_dict[agent_id])
+                      )
+
+        return action_dict, value_dict
+
+    def get_trajectory(self, action_dict, T=1.4, t=0.05):
+        """Calculates trajectories based on action prediction
+
+        This calculation is adapted to the CARLA coordinate system.
+        There might be weird behavior if the road in CARLA is not straight.
+        """
+        traj_dict = {}
+        for agent in self.env.agents:
+
+            # Get state and action
+            position = agent.state.position
+            velocity = agent.state.xy_velocity
+            acceleration = agent.state.xy_acceleration
+            rotation = agent.state.direction_heading
+            action = action_dict[agent.id]
+
+            # Calculate trajectory
+            # s-axis == x-axis in carla
+            # d-axis == -1.0 * y-axis in carla
+            trajectory = self.generator.calculate_trajectory(position=position, velocity=velocity, acceleration=acceleration,
+                                                             deltaV=action[0], deltaD=-1.0 * action[1])
+            # Correct road twist
+            theta = np.radians(rotation)
+            trajectory = self.generator.transform_trajectory(trajectory, theta)
+            traj_dict[agent.id] = trajectory
+
+        return traj_dict
+
+    def accumulate_gradients(self, obs_dict, done_dict):
+        """Accumulates gradients and executes backpropagation"""
+        for agent in self.env.agents:
+            policy = self.policies[agent.id]
+            memory = self.memories[agent.id]
+            history = memory.get_history()
+
+            # Calculate n-step returns
+            if done_dict[agent.id] == 1:
+                R = torch.tensor([[0.0]]).to(self.device)
+            else:
+                obs = obs_dict[agent.id]
+                obs_tensor = self.preprocess_obs(obs)
+                # _, _, value = policy(obs_tensor)
+                _, value = policy(obs_tensor)
+                R = value
+
+            log_probs, entropies, values, rewards = zip(*list(history))
+
+            returns = []
+            for step in range(len(rewards)):
+                R = rewards[step] + self.gamma * R
+                returns.append(R)
+
+            # Concatenate n-step history to batch
+            log_probs = torch.cat(log_probs)
+            entropies = torch.cat(entropies)
+            values = torch.cat(values)
+            returns = torch.cat(returns).detach()
+
+            # Calculate batch loss
+            advantage = returns - values
+            pg_loss = (-1.0 * log_probs * advantage.detach()).mean()
+            entropy = entropies.mean()
+            vf_loss = advantage.pow(2).mean()
+            # loss = pg_loss - self.beta * entropy + self.alpha * vf_loss
+            loss = pg_loss + self.alpha * vf_loss
+
+            # Backward pass
+            loss.backward()
+
+            # Store buffers
+            self.pg_loss_buffer[agent.id].append(pg_loss.item())
+            self.entropy_buffer[agent.id].append(entropy.item())
+            self.vf_loss_buffer[agent.id].append(vf_loss.item())
+            self.total_loss_buffer[agent.id].append(loss.item())
+
+    def get_gradients(self):
+        """Creates the request message to send gradients and receive weights"""
+        # Build request by iterating over each policy
+        gradients_req = UpdateGlobalPolicyRequest()
+
+        # Encode gradients
+        gradients = self.encode_gradients()
+        gradients_req.gradients = gradients
+        # Env id
+        gradients_req.env_id = self.env_id
+        # Episode frames
+        gradients_req.frames = self.frames_buffer
+        # Policy Gradient loss
+        gradients_req.pg_losses = [np.mean(x)
+                                   for x in self.pg_loss_buffer.values()]
+        # Policy Entropy
+        gradients_req.entropies = [np.mean(x)
+                                   for x in self.entropy_buffer.values()]
+        # Value Function loss
+        gradients_req.vf_losses = [np.mean(x)
+                                   for x in self.vf_loss_buffer.values()]
+        # Combined loss
+        gradients_req.total_losses = [np.mean(x)
+                                      for x in self.total_loss_buffer.values()]
+        # Rewards
+        gradients_req.rewards = [np.sum(x)
+                                 for x in self.reward_buffer.values()]
+
+        return gradients_req
+
+    def encode_gradients(self):
+        """Turns gradient tensors into conveyable lists"""
+        gradients = []
+        for policy in self.policies.values():
+            tensors = []
+            for param in policy.parameters():
+                shape = list(param.shape)
+                tensor_list = torch.flatten(param.grad.data).tolist()
+                tensors.append(Tensor(shape, tensor_list))
+            gradients.append(Gradient(tensors))
+        return gradients
+
+    def preprocess_obs(self, obs):
+        """Turns the observations into distinctive tensors"""
+        # Add batch dimensions
+        xV = np.expand_dims(obs[0], 0)
+        xE = [obs[1]]
+        xO = np.expand_dims(obs[2], 0)
+
+        # All: Convert arrays to torch.Tensor
+        obs_tensors = []
+        obs_tensors.append(torch.from_numpy(xV).float().to(self.device))
+        obs_tensors.append(torch.Tensor(xE).float().to(self.device))
+        obs_tensors.append(torch.from_numpy(xO).float().to(self.device))
+
+        return obs_tensors
+
+    def store_values(self, log_prob_dict, entropy_dict, value_dict, reward_dict):
+        """Stores n-step history and reward buffer"""
+        for agent_id, memory in self.memories.items():
+            memory.store(log_prob_dict[agent_id],
+                         entropy_dict[agent_id],
+                         value_dict[agent_id],
+                         reward_dict[agent_id])
+            self.reward_buffer[agent_id].append(reward_dict[agent_id])
+
+    def clear_memories(self):
+        """Clears the n-step memory"""
+        for memory in self.memories.values():
+            memory.clear()
+
+    def clear_episode(self):
+        """Clears the episode buffers"""
+        for agent_id, policy in self.policies.items():
+            policy.zero_grad()
+            self.pg_loss_buffer[agent_id] = []
+            self.entropy_buffer[agent_id] = []
+            self.vf_loss_buffer[agent_id] = []
+            self.total_loss_buffer[agent_id] = []
+            self.reward_buffer[agent_id] = []
+
+        self.frames_buffer = 0
+
+    def is_initialized(self):
+        """Returns if the node is completely initialized"""
+        return self.initialized
+
+    def do_evaluation(self):
+        """Returns if the node is used for evaluation"""
+        return self.evaluate
+
+    def quit(self):
+        """Closes the environment before the node gets shut down"""
+        self.env.close()
+        print('Environment Node quited')
+
+
+if __name__ == '__main__':
+
+    node = EnvNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            if node.do_evaluation():
+                node.run_evaluation()
+            else:
+                node.run_training()
+    finally:
+        node.quit()

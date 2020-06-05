@@ -1,0 +1,9 @@
+# Service to evaluate a policy
+
+# Request
+Tensor[] pi_weights         # weights of the policy network
+Tensor[] vf_weights         # weights of the value network
+
+---
+
+# Response

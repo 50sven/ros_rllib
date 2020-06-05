@@ -1,0 +1,250 @@
+#!/usr/bin/env python
+"""A3C Master Node
+
+This script provides a ROS Node that handles the asynchronous weight updates
+of the global policy for the A3C algorithm
+
+Class:
+    * MasterNode - ROS node for asynchronous updates of the global policy
+"""
+import os
+import rospy
+import socket
+import importlib
+import torch
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from threading import Lock
+
+from ros_carla_rllib.msg import Tensor
+from ros_carla_rllib.srv import UpdateGlobalPolicy
+from ros_carla_rllib.srv import UpdateGlobalPolicyResponse
+from ros_carla_rllib.srv import GetWeights
+from ros_carla_rllib.srv import GetWeightsResponse
+
+
+class MasterNode(object):
+    """
+    Master node to handle weight updates.
+    Runs the service to receive gradients and send weights.
+    """
+
+    def __init__(self):
+
+        self.mutex = Lock()
+        self.initialized = False
+        self.s_update_policy = None
+        self.s_request_weights = None
+        self.global_policy = None
+        self.optimizer = None
+        self.iteration_counter = 0
+        self.i = 1
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        self.initialize_service()
+        self.initialize_writer()
+        self.initialize_policy()
+        self.initialize_optimizer()
+
+        print("Node is running")
+
+    def initialize_node(self):
+        """ """
+        rospy.init_node('master_node_' + socket.gethostname().split('-')[-1])
+        print('Master Node on ' + socket.gethostname() + ' intialized')
+
+    def get_parameter_values(self):
+        """ """
+        # Training Parameter
+        self.exploration = rospy.get_param('~exploration', 100000)
+        self.model = rospy.get_param('~model', "")
+        self.checkpoint = rospy.get_param('~checkpoint', "")
+        self.save_path = rospy.get_param('~save_path', "")
+        self.save_steps = rospy.get_param('~save_steps', 0)
+
+        # Service Parameter
+        self.update_policy_topic = rospy.get_param(
+            '~update_policy_topic', "master/update_policy")
+        self.request_weights_topic = rospy.get_param(
+            '~request_weights_topic', "master/request_weights")
+
+    def initialize_service(self):
+        """ """
+        self.s_update_policy = rospy.Service(
+            self.update_policy_topic, UpdateGlobalPolicy, self.update_policy)
+        self.s_request_weights = rospy.Service(
+            self.request_weights_topic, GetWeights, self.send_weights)
+        print('Services intialized')
+
+        rospy.wait_for_service(self.update_policy_topic)
+        rospy.wait_for_service(self.request_weights_topic)
+        print('Services connected')
+
+    def initialize_policy(self):
+        """ """
+        module = importlib.import_module("ros_carla_rllib.models")
+        self.global_policy = getattr(module, self.model)()
+
+        def init_weights(m):
+            if isinstance(m, torch.nn.Linear) and m.out_features == 2:
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                torch.nn.init.constant_(m.bias, 0.0)
+            if isinstance(m, torch.nn.Linear) and m.out_features == 1:
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.5)
+                torch.nn.init.constant_(m.bias, 0.0)
+
+        if self.checkpoint:
+            self.global_policy.load_state_dict(torch.load(
+                os.path.expanduser(self.checkpoint)))
+        else:
+            self.global_policy.apply(init_weights)
+
+        print("Global policy initialized")
+
+    def initialize_optimizer(self):
+        """ """
+        self.optimizer = torch.optim.RMSprop(
+            self.global_policy.parameters(), lr=1e-4)  # weight_decay=0.99 , momentum=0.95, eps=1e-5)
+
+        self.initialized = True
+        print("Optimizer initialized")
+
+    def initialize_writer(self):
+        """ """
+        self.writer = SummaryWriter(os.path.expanduser(self.save_path))
+
+        print("Logger initialized")
+
+    def run_service(self):
+        """ """
+
+        while not rospy.is_shutdown():
+            pass
+
+    def update_policy(self, req):
+        """Receive gradients, update global policy and return weights"""
+
+        with self.mutex:
+
+            # Apply all gradients
+            for gradient in req.gradients:
+
+                self.global_policy.zero_grad()
+
+                # Transfer gradient to global policy
+                self.transfer_gradient(gradient)
+
+                # Clip gradient
+                torch.nn.utils.clip_grad_norm_(self.global_policy.parameters(),
+                                               1.0)
+                # torch.nn.utils.clip_grad_value_(self.global_policy.parameters(),
+                #                                 1.0)
+
+                # Apply gradient
+                self.optimizer.step()
+                self.iteration_counter += 1
+
+            self._log_iteration(req)
+
+            if (self.save_path and
+                self.save_steps > 0 and
+                    self.iteration_counter >= self.save_steps * self.i):
+                self.save_model()
+                self.i += 1
+
+            weights = self.encode_weights()
+            cov = max(1.0 - self.iteration_counter /
+                      float(self.exploration), 0.05)
+            covariance = [cov, cov]
+
+        return UpdateGlobalPolicyResponse(weights, covariance)
+
+    def transfer_gradient(self, gradient):
+        """ """
+        for param, grad_tensor in zip(self.global_policy.parameters(),
+                                      gradient.tensors):
+            shape = tuple(grad_tensor.shape)
+            flatten_gradients = torch.Tensor(grad_tensor.tensor)
+            gradient = torch.reshape(flatten_gradients, shape)
+            param.grad = gradient.data
+
+    def send_weights(self, req):
+        """Send weights of the global policy"""
+        # Send weights for initialization
+        print("Initializing weights for node {}".format(req.env_id))
+        print("-" * 10)
+
+        weights = self.encode_weights()
+
+        return GetWeightsResponse(policy_weights=weights)
+
+    def encode_weights(self):
+        """Return encoded weights of the global policy"""
+        weights = []
+        for param in self.global_policy.parameters():
+            shape = list(param.shape)
+            param_list = torch.flatten(param.data).tolist()
+            weights.append(Tensor(shape, param_list))
+
+        return weights
+
+    def is_initialized(self):
+        """ """
+        return self.initialized
+
+    def save_model(self):
+        """ """
+        if self.save_path:
+            path = os.path.expanduser(os.path.join(
+                self.save_path, "model_" + str(self.iteration_counter) + ".pt"))
+            torch.save(self.global_policy.state_dict(), path)
+        else:
+            print("SaveError: No path is given.")
+
+    def quit(self):
+        """ """
+        self.s_update_policy.shutdown()
+        self.writer.close()
+        print('Master Node quited')
+
+    def _log_iteration(self, req):
+        """ """
+
+        self.writer.add_scalar("Training/Reward/" + str(req.env_id),
+                               np.sum(req.rewards),
+                               self.iteration_counter)
+        self.writer.add_scalar("Loss/PG_Loss",
+                               np.mean(req.pg_losses),
+                               self.iteration_counter)
+        self.writer.add_scalar("Loss/Entropy",
+                               np.mean(req.entropies),
+                               self.iteration_counter)
+        self.writer.add_scalar("Loss/Value_Loss",
+                               np.mean(req.vf_losses),
+                               self.iteration_counter)
+        self.writer.add_scalar("Loss/Total_Loss",
+                               np.mean(req.total_losses),
+                               self.iteration_counter)
+
+        self.writer.flush()
+
+        print("Node {} sends gradients".format(req.env_id))
+        print("Sum rewards: {}".format(np.sum(req.rewards)))
+        print("Avg pg loss: {}".format(np.mean(req.pg_losses)))
+        print("Avg entropy: {}".format(np.mean(req.entropies)))
+        print("Avg vf loss: {}".format(np.mean(req.vf_losses)))
+        print("Avg combined loss: {}".format(np.mean(req.total_losses)))
+        print("Training iterations: {}". format(self.iteration_counter))
+        print("-" * 10)
+
+
+if __name__ == '__main__':
+
+    node = MasterNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            node.run_service()
+    finally:
+        node.quit()

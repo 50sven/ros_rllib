@@ -1,0 +1,10 @@
+# Weight service to send model parameters
+
+# Request
+string env_id               # name of the environment node
+
+---
+
+# Response
+Tensor[] pi_weights         # weights of the policy network
+Tensor[] vf_weights         # weights of the valuen network

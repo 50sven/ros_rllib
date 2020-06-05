@@ -1,0 +1,94 @@
+<launch>
+    
+    <!-- Node Parameters -->
+    <arg name="type" />
+    <group if="$(eval arg('type')=='env')" >
+      <arg name="index" />
+    </group>
+
+    <!-- Environment Parameters -->
+    <arg name="host"                            default="ids-fly" />
+    <arg name="port"                            default="6379" />
+    <arg name="map"                             default="Town06" />
+    <arg name="sync_mode"                       default="true" />
+    <arg name="delta_sec"                       default="0.05" />
+    <arg name="scenario"                        default="" />
+    <arg name="frame_skip"                      default="0" />
+    <arg name="render"                          default="true" />
+    <arg name="num_agents"                      default="1" />
+    <arg name="agent_type"                      default="discrete" />
+    <arg name="reset_info"                      default="~/no_backup/carla_reset_info/reset_info.json" />
+
+    <!-- Training Parameters -->
+    <arg name="n_step_update"                   default="true" />
+    <arg name="n_step"                          default="5" />
+    <arg name="alpha"                           default="0.5" />
+    <arg name="beta"                            default="0.0001" />
+    <arg name="gamma"                           default="0.99" />
+    <arg name="exploration"                     default="100000" />
+    <arg name="evaluation_iteration_steps"      default="-1" />
+    <arg name="evaluation_iteration_episodes"   default="-1" />
+    <arg name="model"                           default="SoloHybridModel" />
+    <arg name="gpu"                             default="false" />
+    <arg name="save_path"                       default="~/no_backup/Training/test_a3c_trajectory" />
+    <arg name="save_steps"                      default="10000" />
+    
+    <!-- Evaluation/Initialization -->
+    <arg name="evaluate"                        default="true" />
+    <arg name="evaluate_with_sigma"             default="0.0" />
+    <arg name="repetitions"                     default="100" />
+    <arg name="checkpoint"                      default="~/no_backup/Training/test_a3c_trajectory/model_250000.pt" />
+
+    <!-- Topic Parameters -->
+    <arg name="update_policy_topic"             default="master/update_policy" />
+    <arg name="request_weights_topic"           default="master/request_weights" />
+
+    <!-- Master Node -->
+    <node pkg="ros_carla_rllib"     type="master_a3c"                      name="master_a3c"
+          output="screen"           if="$(eval arg('type')=='master')" >
+        <!-- Training -->
+        <param name="exploration"                   type="int"          value="$(arg exploration)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="checkpoint"                    type="string"       value="$(arg checkpoint)" />
+        <param name="save_path"                     type="string"       value="$(arg save_path)" />
+        <param name="save_steps"                    type="int"          value="$(arg save_steps)" />
+        <!-- Service Topic -->
+        <param name="update_policy_topic"           type="string"       value="$(arg update_policy_topic)" />
+        <param name="request_weights_topic"         type="string"       value="$(arg request_weights_topic)" />
+    </node>
+
+    <!-- Env Node -->
+<!-- $(env HOST) -->
+    <node pkg="ros_carla_rllib"     type="env_a3c"                         name="env_$(arg index)" 
+          output="screen"           if="$(eval arg('type')=='env')" >
+        <!-- Environment -->
+        <param name="host"                          type="string"       value="$(arg host)" />
+        <param name="port"                          type="int"          value="$(arg port)" />
+        <param name="map"                           type="string"       value="$(arg map)" />
+        <param name="sync_mode"                     type="bool"         value="$(arg sync_mode)" />
+        <param name="delta_sec"                     type="double"       value="$(arg delta_sec)" />
+        <param name="scenario"                      type="string"       value="$(arg scenario)" />
+        <param name="frame_skip"                    type="int"          value="$(arg frame_skip)" />
+        <param name="render"                        type="bool"         value="$(arg render)" />
+        <param name="agent_type"                    type="string"       value="$(arg agent_type)" />
+        <param name="num_agents"                    type="int"          value="$(arg num_agents)" />
+        <param name="reset_info"                    type="string"       value="$(arg reset_info)" />
+        <!-- Training -->
+        <param name="n_step_update"                 type="bool"         value="$(arg n_step_update)" />
+        <param name="n_step"                        type="int"          value="$(arg n_step)" />
+        <param name="alpha"                         type="double"       value="$(arg alpha)" />
+        <param name="beta"                          type="double"       value="$(arg beta)" />
+        <param name="gamma"                         type="double"       value="$(arg gamma)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="gpu"                           type="bool"         value="$(arg gpu)" />
+        <!-- Service Topic -->
+        <param name="update_policy_topic"           type="string"       value="$(arg update_policy_topic)" />
+        <param name="request_weights_topic"         type="string"       value="$(arg request_weights_topic)" />
+        <!-- Evaluation/Initialization -->
+        <param name="evaluate"                      type="bool"         value="$(arg evaluate)" />
+        <param name="evaluate_with_sigma"           type="double"       value="$(arg evaluate_with_sigma)" />
+        <param name="repetitions"                   type="int"          value="$(arg repetitions)" />
+        <param name="checkpoint"                    type="string"       value="$(arg checkpoint)" />
+    </node>
+
+</launch>

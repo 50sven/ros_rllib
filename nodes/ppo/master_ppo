@@ -1,0 +1,691 @@
+#!/usr/bin/env python
+"""PPO Master Node
+
+This script provides a ROS Node that collects rollout data
+and manages the PPO algorithm.
+
+Class:
+    * MasterNode - ROS node for PPO optimization
+"""
+import os
+import json
+import time
+import rospy
+import socket
+import torch
+import numpy as np
+from threading import Lock
+from torch.distributions import kl_divergence
+from torch.nn.utils.rnn import pack_sequence
+from torch.utils.tensorboard import SummaryWriter
+
+from ros_carla_rllib.msg import Tensor, Rollout
+from ros_carla_rllib.srv import GetWeights
+from ros_carla_rllib.srv import GetWeightsResponse
+from ros_carla_rllib.srv import GetState
+from ros_carla_rllib.srv import GetStateResponse
+from ros_carla_rllib.srv import RunEvaluation
+from ros_carla_rllib.srv import RunEvaluationRequest
+from ros_carla_rllib.memories import PPOBuffer
+from ros_carla_rllib.policies import ActorCritic
+
+
+class MasterNode(object):
+    """
+    Master node to organize the PPO algorithm
+    """
+
+    def __init__(self):
+
+        self.mutex = Lock()
+        self.mutex_2 = Lock()
+        self.initialized = False
+        self.update_underway = False
+        self.update_counter = 0
+        self.trainings_env = []
+        self.policy = None
+        self.pi_optimizer = None
+        self.vf_optimizer = None
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        self.initialize_policy()
+        self.initialize_optimizers()
+        self.initialize_subscriber()
+        self.initialize_services()
+        self.initialize_writer()
+
+        self.initialized = True
+        print("Node is running")
+
+    def initialize_node(self):
+        """ """
+        rospy.init_node('master_node_' + socket.gethostname().split('-')[-1])
+        print('Master Node on ' + socket.gethostname() + ' initialized')
+
+    def get_parameter_values(self):
+        """ """
+        # Training Parameter
+        self.clip_eps = rospy.get_param('~clip_eps', 0.2)
+        self.clip_eps_vf = rospy.get_param('~clip_eps_vf', -1.0)
+        self.batch_size = rospy.get_param('~batch_size', 4096)
+        self.mini_batch_size_p = rospy.get_param('~mini_batch_size', 1024)
+        self.mini_batch_size_vf = rospy.get_param('~mini_batch_size_vf', 4096)
+        self.policy_epochs = rospy.get_param('~policy_epochs', 80)
+        self.value_epochs = rospy.get_param('~value_epochs', 80)
+        self.lr_pi_init = rospy.get_param('~lr_pi', 0.0003)
+        self.lr_pi = self.lr_pi_init
+        self.lr_vf_init = rospy.get_param('~lr_vf', 0.001)
+        self.lr_vf = self.lr_vf_init
+        self.lr_pi_decay_type = rospy.get_param('~lr_pi_decay_type', "linear")
+        self.lr_pi_decay = rospy.get_param('~lr_pi_decay', 245.0)
+        self.lr_pi_min = rospy.get_param('~lr_pi_min', 0.000001)
+        self.grad_norm = rospy.get_param('~grad_norm', 0.5)
+        self.kl_target = rospy.get_param('~kl_target', 0.01)
+        self.kl_coef = rospy.get_param('~kl_coef', 0.0)
+        self.ent_coef = rospy.get_param('~ent_coef', 0.0)
+        self.norm_adv = rospy.get_param('~norm_adv', True)
+        self.policy_n = rospy.get_param('~policy', "gaussian")
+        self.model = rospy.get_param('~model', "")
+        self.gpu = rospy.get_param('~gpu', True)
+        self.verbose = rospy.get_param('~verbose', False)
+        self.device = torch.device("cuda") if (
+            torch.cuda.is_available() and self.gpu) else torch.device("cpu")
+        self.checkpoint = rospy.get_param('~checkpoint', "")
+        self.save_path = rospy.get_param('~save_path', "")
+        self.reset_info = rospy.get_param('~reset_info', "")
+        with open(os.path.expanduser(self.reset_info), "r") as f:
+            self.reset_info = json.load(f)
+        self.scenario_counter = dict()
+        for w, v in self.reset_info.items():
+            for s in v:
+                self.scenario_counter[(str(w), str(s))] = 0
+        self.scenario_idx = 0
+        self.scenarios = list(self.scenario_counter.keys())
+        self.scenario_samples = (self.batch_size / len(self.scenarios)) + 1
+
+        # Trajectory Planning
+        self.dV_amp = rospy.get_param('~dV_amp', 5.0)
+        self.dL_amp = rospy.get_param('~dL_amp', 3.5)
+
+        # Service Parameter
+        self.weights_topic = rospy.get_param(
+            '~weights_topic', "master/weights")
+        self.eval_topic = rospy.get_param(
+            '~eval_topic', "evaluation/stats")
+        self.state_topic = rospy.get_param(
+            '~state_topic', "master/state")
+
+        # Subscriber Parameter
+        self.rollouts_topic = rospy.get_param(
+            '~rollouts_topic', "env/rollouts")
+
+    def initialize_services(self):
+        """ """
+        self.evaluation_service = rospy.ServiceProxy(
+            self.eval_topic, RunEvaluation)
+        rospy.wait_for_service(self.eval_topic)
+
+        self.weights_service = rospy.Service(
+            self.weights_topic, GetWeights, self.send_weights)
+        rospy.wait_for_service(self.weights_topic)
+
+        self.state_service = rospy.Service(
+            self.state_topic, GetState, self.send_state)
+        rospy.wait_for_service(self.state_topic)
+        print('Services initialized')
+
+    def initialize_subscriber(self):
+        """ """
+        self.rollout_subscriber = rospy.Subscriber(
+            self.rollouts_topic, Rollout, self.retrieve_rollout, queue_size=100)
+        print('Subscriber initialized')
+
+    def initialize_policy(self):
+        """ """
+        self.policy = ActorCritic(self.model, self.policy_n, self.device)
+        self.buffer = PPOBuffer(self.batch_size, self.norm_adv)
+
+        def init_weights():
+            """ """
+            # Policy Mean
+            torch.nn.init.xavier_normal_(
+                self.policy.pi.model.fcOut.weight, 0.01)
+            torch.nn.init.constant_(self.policy.pi.model.fcOut.bias, 0.0)
+            # Value
+            torch.nn.init.xavier_normal_(
+                self.policy.value_fn.model.fcOut.weight, 1.0)
+            torch.nn.init.constant_(self.policy.value_fn.model.fcOut.bias, -40.0)
+
+        init_weights()
+
+        print("Policy initialized")
+
+    def initialize_optimizers(self):
+        """ """
+        self.pi_optimizer = torch.optim.Adam(
+            self.policy.pi.parameters(), lr=self.lr_pi, eps=1e-5)
+        self.vf_optimizer = torch.optim.Adam(
+            self.policy.value_fn.parameters(), lr=self.lr_vf, eps=1e-5)
+
+        if self.checkpoint:
+            self.load_weights()
+
+        print("Optimizers initialized")
+
+    def initialize_writer(self):
+        """ """
+        self.writer = SummaryWriter(os.path.expanduser(self.save_path),
+                                    purge_step=None)
+
+        print("Logger initialized")
+
+    def run_training(self):
+        """Runs PPO updates when batch size is reached"""
+        while not rospy.is_shutdown():
+
+            # 1. collect rollouts
+            # see subscriber callback function: retrieve_rollout()
+
+            # 2. Check buffer size and update policy
+            if len(self.buffer) >= self.batch_size:
+                # Toggle state and destroy subscriber
+                self.toggleState()
+                self.unsubscribe()
+                time.sleep(1.0)
+                # Update policy weights with PPO algorithm
+                self.run_optimization()
+                self.buffer.flush()
+                time.sleep(1.0)
+                # Toggle state and initialize subscriber
+                self.initialize_subscriber()
+                time.sleep(1.0)
+                self.toggleState()
+                # Evaluate current policy
+                self.evaluate_policy()
+
+    def unsubscribe(self):
+        """ """
+        self.rollout_subscriber.unregister()
+
+    def evaluate_policy(self):
+        """ """
+        pi_weights, vf_weights = self.encode_weights()
+        _ = self.evaluation_service(RunEvaluationRequest(pi_weights=pi_weights,
+                                                         vf_weights=vf_weights))
+        print("Policy has been evaluated")
+        print("-" * 30)
+
+    def run_optimization(self):
+        """Runs a PPO optimization step"""
+        # Get batch
+        (obs, action, old_logp, old_value, return_, advantage) = self.buffer.eject()
+
+        # Train pi
+        print("-" * 20 + "\nPi Update" + "\n" + "-" * 20)
+        (policy_loss, entropy,
+         kl_divergence, clipping_fraction, steps) = self.update_actor(obs, action, old_logp, advantage)
+
+        # Train value function
+        print("-" * 20 + "\nValue Function Update" + "\n" + "-" * 20)
+        (value_loss,
+         explained_variance) = self.update_critic(obs, old_value, return_)
+
+        # Logging
+        self.update_counter += 1
+        self.log_update(policy_loss, entropy, kl_divergence, clipping_fraction,
+                        value_loss, explained_variance, steps)
+
+        # Update learning rate
+        self.decay_lr()
+
+        # Save current weights (overwrites previous weights)
+        self.save_weights()
+
+        # Empty scenario counter
+        self.scenario_counter = dict.fromkeys(self.scenario_counter, 0)
+
+    def update_actor(self, obs, action, old_logp, advantage):
+        """
+        """
+        early_stop = False
+        grad_step_count = 0
+        policy_losses = []
+        self.grad_norms = []
+        self.ratios = []
+        self.clipped_ratios = []
+
+        for epoch in range(self.policy_epochs):
+            print("Epoch " + str(epoch + 1))
+            indexes = torch.randperm(self.batch_size)
+            loss = []
+            ent = []
+            kl = []
+            clip_frac = []
+            for start in range(0, self.batch_size, self.mini_batch_size_p):
+                # Get mini-batch
+                end = start + self.mini_batch_size_p
+                mb_indexes = indexes[start:end]
+                mb_obs = []
+                mb_obs.append(obs[0][mb_indexes].to(self.device))
+                mb_obs.append(obs[1][mb_indexes].to(self.device))
+                mb_obs.append(obs[2][mb_indexes].to(self.device))
+
+                # For LSTM:
+                # mb_obs.append([obs[2][int(i)].to(self.device)
+                #                for i in mb_indexes])
+
+                mb_action = action[mb_indexes].to(self.device)
+                mb_old_logp = old_logp[mb_indexes].to(self.device)
+                mb_advantage = advantage[mb_indexes].to(self.device)
+
+                # For LSTM:
+                # (mb_obs, mb_action,
+                #  mb_advantage) = self.pack_and_sort_batch(mb_obs, mb_action, mb_advantage)
+
+                # Importance weights
+                mb_pi, mb_logp = self.policy.pi(mb_obs, mb_action)
+                ratio = torch.exp(mb_logp - mb_old_logp)
+                # Surrogate loss
+                surr1 = ratio * mb_advantage
+                surr2 = torch.clamp(ratio,
+                                    1.0 - self.clip_eps,
+                                    1.0 + self.clip_eps) * mb_advantage
+                # KL divergence
+                # TODO: proper calculation of kl divergence instead of approximation
+                mb_kl = (mb_old_logp - mb_logp).mean()
+                # Entropy
+                entropy = mb_pi.entropy().mean()
+                # Loss
+                policy_loss = -torch.min(surr1, surr2).mean() + \
+                    self.kl_coef * mb_kl - self.ent_coef * entropy
+               # Backpropagation and gradient clipping
+                self.pi_optimizer.zero_grad()
+                policy_loss.backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(self.policy.pi.parameters(),
+                                                            self.grad_norm)
+                # Gradient step
+                self.pi_optimizer.step()
+                grad_step_count += 1
+
+                # Diagnostics: Ratios and clipping fraction
+                mb_cf = ((ratio - 1.0).abs() >
+                         self.clip_eps).type(torch.FloatTensor).mean()
+
+                self.ratios.append(torch.clamp(
+                    ratio, 0.0, 10.0).clone().detach().cpu().numpy())
+                self.clipped_ratios.append(torch.clamp(ratio,
+                                                       1.0 - self.clip_eps,
+                                                       1.0 + self.clip_eps).clone().detach().cpu().numpy())
+                self.grad_norms.append(total_norm)
+                loss.append(policy_loss.item())
+                ent.append(entropy.item())
+                kl.append(mb_kl.item())
+                clip_frac.append(mb_cf.item())
+
+                print("\tPolicy loss: {0:.4f}   ".format(policy_loss) +
+                      "Entropy: {0:.4f}   ".format(entropy) +
+                      "KL-Div: {0:.4f}   ".format(mb_kl) +
+                      "Clip Fraction: {0:.4f}   ".format(mb_cf))
+
+                # Adaptive KL-Divergence
+                if mb_kl > 1.5 * self.kl_target:
+                    self.kl_coef *= 1.5
+                    early_stop = True
+                elif mb_kl < 0.5 * self.kl_target:
+                    self.kl_coef /= 1.5
+
+                # Early Stopping
+                if early_stop:
+                    break
+
+            print("\t" + "-" * 5)
+            print("\tPolicy loss: {0:.4f}   ".format(np.mean(loss)) +
+                  "Entropy: {0:.4f}   ".format(np.mean(ent)) +
+                  "KL-Div: {0:.4f}   ".format(np.mean(kl)) +
+                  "Clip Fraction: {0:.4f}   ".format(np.mean(clip_frac)))
+
+            policy_losses.append(np.mean(loss))
+            kl_div = np.mean(kl)
+
+            # Early Stopping
+            if early_stop:
+                break
+
+        return np.mean(policy_losses), np.mean(ent), kl_div, np.mean(clip_frac), grad_step_count
+
+    def update_critic(self, obs, old_value, return_):
+        """ """
+        value_losses = []
+        for epoch in range(self.value_epochs):
+            print("Epoch " + str(epoch + 1))
+            indexes = torch.randperm(self.batch_size)
+            loss = []
+            exp_var = []
+            for start in range(0, self.batch_size, self.mini_batch_size_vf):
+                # Get mini-batch
+                end = start + self.mini_batch_size_vf
+                mb_indexes = indexes[start:end]
+                mb_obs = []
+                mb_obs.append(obs[0][mb_indexes].to(self.device))
+                mb_obs.append(obs[1][mb_indexes].to(self.device))
+                mb_obs.append(obs[2][mb_indexes].to(self.device))
+
+                # For LSTM:
+                # mb_obs.append([obs[2][int(i)].to(self.device)
+                #                for i in mb_indexes])
+
+                mb_return = return_[mb_indexes].to(self.device)
+                mb_old_value = None
+                if self.clip_eps_vf >= 0.0:
+                    mb_old_value = old_value[mb_indexes].to(self.device)
+
+                # For LSTM
+                # (mb_obs, mb_old_value,
+                #  mb_return) = self.pack_and_sort_batch(mb_obs, mb_old_value, mb_return)
+
+                # Get state-value
+                mb_value = self.policy.value_fn(mb_obs)
+                # Loss
+                if self.clip_eps_vf >= 0.0:
+                    mb_value_clipped = mb_old_value + torch.clamp(mb_value.flatten() - mb_old_value,
+                                                                    -self.clip_eps_vf, self.clip_eps_vf)
+                    vf_loss1 = (mb_value.flatten() - mb_return).pow(2)
+                    vf_loss2 = (mb_value_clipped - mb_return).pow(2)
+                    value_loss = 0.5 * torch.max(vf_loss1, vf_loss2).mean()
+                else:
+                    value_loss = 0.5 * (mb_value.flatten() -
+                                        mb_return).pow(2).mean()
+
+                # Backpropagation and gradient clipping
+                self.vf_optimizer.zero_grad()
+                value_loss.backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(self.policy.value_fn.parameters(),
+                                                            self.grad_norm)
+                # Gradient step
+                self.vf_optimizer.step()
+                # Diagnostics: Explained variance
+                mb_exp_var = (1 -
+                              (mb_return - mb_value.flatten()).var() / (mb_return.var() + 1e-5))
+
+                loss.append(value_loss.item())
+                exp_var.append(mb_exp_var.item())
+                print("\tValue loss: {0:.4f}   ".format(value_loss) +
+                      "Explained Variance: {0:.4f}".format(mb_exp_var))
+
+            print("\t" + "-" * 5)
+            print("\tValue loss: {0:.4f}   ".format(np.mean(loss)) +
+                  "Explained Variance: {0:.4f}".format(np.mean(exp_var)))
+            value_losses.append(np.mean(loss))
+
+        return np.mean(value_losses), np.mean(exp_var)
+
+    def decay_lr(self):
+        """Decays the learning rate"""
+        if self.lr_pi_decay_type == "linear":
+            self.lr_pi = self.lr_pi_init * \
+                (1 - self.update_counter / float(self.lr_pi_decay))
+        if self.lr_pi_decay_type == "exponential":
+            self.lr_pi = self.lr_pi_init * \
+                np.exp(-self.lr_pi_decay * self.update_counter)
+        self.lr_pi = np.clip(self.lr_pi, self.lr_pi_min, self.lr_pi_init)
+        for g in self.pi_optimizer.param_groups:
+            g['lr'] = self.lr_pi
+
+    def pack_and_sort_batch(self, obs, actions_values, advantages_returns):
+        """Packs LSTM input and sorts batch accordingly"""
+        # Get sequence lengths and sorted indices
+        seq_lens = torch.tensor([len(seq) for seq in obs[2]])
+        sorted_indices = seq_lens.sort(descending=True).indices
+
+        # Sort obs, actions/values and advantages/returns
+        sorted_xV = obs[0][sorted_indices]
+        sorted_xE = obs[1][sorted_indices]
+        sorted_xO = [obs[2][int(idx)] for idx in sorted_indices]
+        sorted_actions_values = actions_values[sorted_indices]
+        sorted_advantages_returns = advantages_returns[sorted_indices]
+
+        # Pack variable LSTM inputs
+        packed_xO = pack_sequence(sorted_xO)
+
+        return [sorted_xV, sorted_xE, packed_xO], sorted_actions_values, sorted_advantages_returns
+
+    def send_weights(self, req):
+        """Returns current model parameters of policy and value function"""
+        with self.mutex_2:
+            # Send empty response if update is underway
+            if self.update_underway:
+                return GetWeightsResponse()
+            else:
+                print("Sending weights to node {}".format(req.env_id))
+                print("-" * 10)
+                if req.env_id not in self.trainings_env:
+                    self.trainings_env.append(req.env_id)
+
+                pi_weights, vf_weights = self.encode_weights()
+
+                return GetWeightsResponse(pi_weights=pi_weights,
+                                          vf_weights=vf_weights)
+
+    def retrieve_rollout(self, rollout):
+        """Stores rollout data retrieved from an environment node"""
+        with self.mutex:
+            world, scenario = str(rollout.world), str(rollout.scenario)
+            # If scenario is done -> discard rollout
+            if self.scenario_counter[(world, scenario)] >= self.scenario_samples:
+                counter_samples = np.sum(self.scenario_counter.values())
+                if counter_samples >= self.batch_size and len(self.buffer) < self.batch_size:
+                    self.scenario_counter[(world, scenario)
+                                          ] -= (self.batch_size - self.buffer)
+            # If scenario is not done -> store rollout data
+            else:
+                trajectory = zip(rollout.observations, rollout.actions,
+                                 rollout.values, rollout.returns, rollout.advantages)
+                for obs, action, value, return_, advantage in trajectory:
+                    shaped_obs = self.shape_obs(obs)
+                    self.buffer.append(shaped_obs, action.action, action.logp,
+                                       value, return_, advantage)
+                    self.scenario_counter[(world, scenario)] += 1
+                    if self.scenario_counter[(world, scenario)] >= self.scenario_samples:
+                        self.scenario_idx = (
+                            self.scenario_idx + 1) % len(self.scenarios)
+                        break
+                self.buffer.episode_rewards.append(np.sum(rollout.rewards))
+                self.buffer.episode_lengths.append(rollout.episode_length)
+
+    def shape_obs(self, obs):
+        """Reshapes observations to original size"""
+        xV_shape = tuple(int(i) for i in obs.ego_visual_shape)
+        xV = np.reshape(obs.ego_visual, xV_shape)
+        xE = obs.ego_vector
+        xO = np.reshape(obs.other_vectors, (obs.num_agents, len(obs.ego_vector))
+                        ) if obs.other_vectors else []
+
+        return [xV, xE, xO]
+
+    def encode_weights(self):
+        """Returns encoded weights of policy and value function"""
+        pi_weights, vf_weights = [], []
+        for param_p in self.policy.pi.parameters():
+            shape_p = list(param_p.shape)
+            param_list_p = torch.flatten(param_p.data).tolist()
+            pi_weights.append(Tensor(shape_p, param_list_p))
+        for param_v in self.policy.value_fn.parameters():
+            shape_v = list(param_v.shape)
+            param_list_v = torch.flatten(param_v.data).tolist()
+            vf_weights.append(Tensor(shape_v, param_list_v))
+        return pi_weights, vf_weights
+
+    def toggleState(self):
+        """ """
+        self.update_underway = not self.update_underway
+
+    def send_state(self, req):
+        """Returns the state of the master node"""
+        state = GetStateResponse()
+        state.update_underway = self.update_underway
+        state.world = self.scenarios[self.scenario_idx][0]
+        state.scenario = self.scenarios[self.scenario_idx][1]
+
+        return state
+
+    def log_update(self, policy_loss, entropy, kl_divergence, clipping_fraction,
+                   value_loss, explained_variance, steps):
+        """Writes to tensorboard file"""
+
+        # Diagnostics
+        self.writer.add_scalar("Diagnostics/Policy/PolicyLoss",
+                               policy_loss,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Policy/Entropy",
+                               entropy,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Policy/KLDivergence",
+                               kl_divergence,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Policy/ClipFraction",
+                               clipping_fraction,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Value/ValueLoss",
+                               value_loss,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Value/ValueEstimate",
+                               np.mean(self.buffer.values),
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Value/ExplainedVariance",
+                               explained_variance,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Info/LearningRate",
+                               self.lr_pi,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Info/TotalTimesteps",
+                               self.update_counter * self.batch_size,
+                               self.update_counter)
+        self.writer.add_scalar("Diagnostics/Info/KLDivCoef",
+                               self.kl_coef,
+                               self.update_counter)
+        # Training Episodes
+        self.writer.add_scalar("Training/Episodes/PolicyGradientSteps",
+                               steps,
+                               self.update_counter)
+        mean_frames = np.mean(self.buffer.episode_lengths)
+        std_frames = np.std(self.buffer.episode_lengths)
+        self.writer.add_scalar("Training/Episodes/Mean_Frames",
+                               mean_frames,
+                               self.update_counter)
+        self.writer.add_scalar("Training/Episodes/Std_Frames",
+                               std_frames,
+                               self.update_counter)
+        self.writer.add_histogram("Training/Episodes/Frames",
+                                  np.array(self.buffer.episode_lengths),
+                                  self.update_counter)
+        mean_reward = np.mean(self.buffer.episode_rewards)
+        std_reward = np.std(self.buffer.episode_rewards)
+        rews_per_frame = np.array(self.buffer.episode_rewards) / \
+            np.array(self.buffer.episode_lengths, dtype=np.float)
+        self.writer.add_scalar("Training/Episodes/Mean_Reward",
+                               mean_reward,
+                               self.update_counter)
+        self.writer.add_scalar("Training/Episodes/Std_Reward",
+                               std_reward,
+                               self.update_counter)
+        self.writer.add_scalar("Training/Episodes/Reward_per_Frame_Mean",
+                               np.mean(rews_per_frame),
+                               self.update_counter)
+        self.writer.add_scalar("Training/Episodes/Reward_per_Frame_Std",
+                               np.std(rews_per_frame),
+                               self.update_counter)
+        self.writer.add_histogram("Training/Episodes/Rewards",
+                                  np.array(self.buffer.episode_rewards),
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Episodes/Rewards_per_Frame",
+                                  rews_per_frame,
+                                  self.update_counter)
+        actions = np.array(self.buffer.actions)
+        self.writer.add_histogram("Training/Action/DeltaVel",
+                                  actions[:, 0],
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Action/DeltaLat",
+                                  actions[:, 1],
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Values",
+                                  np.array(self.buffer.values),
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Avantages",
+                                  np.array(self.buffer.advantages),
+                                  self.update_counter)
+        self.writer.add_histogram("Training/GradNorms",
+                                  np.array(self.grad_norms),
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Ratio/Ratio",
+                                  np.array(self.ratios).flatten(),
+                                  self.update_counter)
+        self.writer.add_histogram("Training/Ratio/ClippedRatio",
+                                  np.array(self.clipped_ratios).flatten(),
+                                  self.update_counter)
+
+        self.writer.flush()
+
+        print("-" * 30)
+        print("PPO Optimization")
+        print("Policy_Loss: {}\t\t".format(policy_loss))
+        print("Value_Loss: {}\t\t".format(value_loss))
+        print("Entropy: {}\t\t".format(entropy))
+        print("Lr_pi: {}\t\t".format(self.lr_pi))
+        print("Lr_vf: {}\t\t".format(self.lr_vf))
+        print("KL_Divergence: {}\t\t".format(kl_divergence))
+        print("Clip_Fraction: {}\t\t".format(clipping_fraction))
+        print("Exp_Variance: {}\t\t".format(explained_variance))
+        print("Mean_Reward: {}\t\t".format(mean_reward))
+        print("Std_Reward: {}\t\t".format(std_reward))
+        print("Mean_Frames: {}\t\t".format(mean_frames))
+        print("Std_Frames: {}\t\t".format(std_frames))
+        print("Mean_Reward_per_frame: {}\t\t".format(np.mean(rews_per_frame)))
+        print("Std_Reward_per_frame: {}\t\t".format(np.std(rews_per_frame)))
+        print("Optimization steps: {}\t\t". format(self.update_counter))
+        print("-" * 30)
+
+    def load_weights(self):
+        """Loads model parameters"""
+        path = os.path.expanduser(self.checkpoint)
+        checkpoint = torch.load(path)
+        self.update_counter = checkpoint["counter"]
+        self.policy.pi.load_state_dict(checkpoint["pi"])
+        self.policy.value_fn.load_state_dict(checkpoint["vf"])
+        try:
+            self.policy.pi.load_state_dict(
+                checkpoint["pi_optim"])
+            self.vf_optimizer.load_state_dict(checkpoint["vf_optim"])
+        except:
+            print("No optimizer checkpoint.")
+        print("Checkpoint loaded: " + path)
+
+    def save_weights(self, file_name="current_checkpoint"):
+        """Saves model parameters"""
+        path = os.path.expanduser(os.path.join(
+            self.save_path, file_name + ".pt"))
+        torch.save({"counter": self.update_counter,
+                    "pi": self.policy.pi.state_dict(),
+                    "vf": self.policy.value_fn.state_dict(),
+                    "pi_optim": self.pi_optimizer.state_dict(),
+                    "vf_optim": self.vf_optimizer.state_dict()}, path)
+
+    def is_initialized(self):
+        """ """
+        return self.initialized
+
+    def quit(self):
+        """ """
+        self.writer.close()
+        print('Master Node quited')
+
+
+if __name__ == '__main__':
+
+    node = MasterNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            node.run_training()
+    finally:
+        node.quit()

@@ -1,0 +1,17 @@
+# Service for asynchronous updates in A3C
+
+# Request
+string env_id               # name of the environment node
+uint16 frames               # number of episode frames
+float32[] pg_losses         # average policy gradient loss for each agent
+float32[] entropies         # average policy entropy for each agent
+float32[] vf_losses         # average value function loss for each agent
+float32[] total_losses      # average loss for each agent
+float32[] rewards           # average reward for each agent
+Gradient[] gradients        # gradients for updating the global model
+
+---
+
+# Response
+Tensor[] weights            # weights of the global model
+float32[] covariance        # adaptive covariance

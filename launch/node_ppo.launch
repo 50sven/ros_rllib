@@ -1,0 +1,169 @@
+<launch>
+
+    <!-- Node Parameters -->
+    <arg name="type" />
+    <arg name="index"                           default=""/>
+
+    <!-- Environment Parameters -->
+    <arg name="host"                            default="localhost" />
+    <arg name="port"                            default="6379" />
+    <arg name="map"                             default="two_lane_road" />
+    <arg name="sync_mode"                       default="true" />
+    <arg name="delta_sec"                       default="0.05" />
+    <arg name="scenario"                        default="test_1" />
+    <arg name="frame_skip"                      default="0" />
+    <arg name="render"                          default="false" />
+    <arg name="agent_type"                      default="discrete" />
+    <arg name="reset_info"                      default="~/no_backup/carla_reset_info/solo_test.json" />
+
+    <!-- Trajectory Planning -->
+    <arg name="deltaT"				                  default="1.0" />
+    <arg name="dt"				                      default="0.05" />
+    <arg name="fraction"				                default="0.25" />
+    <arg name="dV_amp"				                  default="3.5" />
+    <arg name="dL_amp"				                  default="1.75" />
+
+    <!-- Training Parameters -->
+    <arg name="clip_eps"                        default="0.2" />
+    <arg name="clip_eps_vf"                     default="-1.0" />
+    <arg name="lambda"                          default="0.95" />
+    <arg name="gamma"                           default="0.98" />
+    <arg name="batch_size"                      default="4096" />
+    <arg name="mini_batch_size"                 default="1024" />
+    <arg name="mini_batch_size_vf"              default="4096" />
+    <arg name="policy_epochs"                   default="8" />
+    <arg name="value_epochs"                    default="32" />
+    <arg name="lr_pi"                           default="0.00005" />
+    <arg name="lr_vf"                           default="0.001" />
+    <arg name="lr_pi_decay_type"                default="" />
+    <arg name="lr_pi_decay"                     default="0.0" />
+    <arg name="lr_pi_min"                       default="0.0" />
+    <arg name="grad_norm"                       default="0.5" />
+    <arg name="kl_target"                       default="0.01" />
+    <arg name="kl_coef"                         default="0.0" />
+    <arg name="ent_coef"                        default="0.0" />
+    <arg name="norm_adv"				                default="true" />
+    <arg name="coop_factor"                     default="0.0" />
+    <arg name="policy"                          default="gaussian" />
+    <arg name="model"                           default="Model" />
+    <arg name="gpu"                             default="true" />
+    <arg name="verbose"                         default="false" />
+
+    <!-- Evaluation/Initialization -->
+    <arg name="repetitions"                     default="5" />
+    <arg name="checkpoint"                      default="" />
+    <arg name="save_path"                       default="~/no_backup/Training/solo/test" />
+
+    <!-- Topic Parameters -->
+    <arg name="weights_topic"                   default="master/weights" />
+    <arg name="state_topic"                     default="master/state" />
+    <arg name="rollouts_topic"                  default="env/rollouts" />
+    <arg name="eval_topic"                      default="evaluation/stats" />
+
+    <!-- Master Node -->
+    <node pkg="ros_carla_rllib"     type="master_ppo"                      name="master_ppo"
+          output="screen"           if="$(eval arg('type')=='master')" >
+        <!-- Training -->
+        <param name="clip_eps"                      type="double"       value="$(arg clip_eps)" />
+        <param name="clip_eps_vf"                   type="double"       value="$(arg clip_eps_vf)" />
+        <param name="batch_size"                    type="int"          value="$(arg batch_size)" />
+        <param name="mini_batch_size"               type="int"          value="$(arg mini_batch_size)" />
+        <param name="mini_batch_size_vf"            type="int"          value="$(arg mini_batch_size_vf)" />
+        <param name="policy_epochs"                 type="int"          value="$(arg policy_epochs)" />
+        <param name="value_epochs"                  type="int"          value="$(arg value_epochs)" />
+        <param name="lr_pi"                         type="double"       value="$(arg lr_pi)" />
+        <param name="lr_vf"                         type="double"       value="$(arg lr_vf)" />
+        <param name="lr_pi_decay_type"              type="string"       value="$(arg lr_pi_decay_type)" />
+        <param name="lr_pi_decay"                   type="double"       value="$(arg lr_pi_decay)" />
+        <param name="lr_pi_min"                     type="double"       value="$(arg lr_pi_min)" />
+        <param name="grad_norm"                     type="double"       value="$(arg grad_norm)" />
+        <param name="kl_target"                     type="double"       value="$(arg kl_target)" />
+        <param name="kl_coef"                       type="double"       value="$(arg kl_coef)" />
+        <param name="ent_coef"                      type="double"       value="$(arg ent_coef)" />
+        <param name="norm_adv"                      type="bool"         value="$(arg norm_adv)" />
+        <param name="policy"                        type="string"       value="$(arg policy)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="gpu"                           type="bool"         value="$(arg gpu)" />
+        <param name="verbose"                       type="bool"         value="$(arg verbose)" />
+        <param name="checkpoint"                    type="string"       value="$(arg checkpoint)" />
+        <param name="save_path"                     type="string"       value="$(arg save_path)" />
+        <param name="reset_info"                    type="string"       value="$(arg reset_info)" />
+        <!-- Trajectory Planning -->
+        <param name="dV_amp"                        type="double"       value="$(arg dV_amp)" />
+        <param name="dL_amp"                        type="double"       value="$(arg dL_amp)" />
+        <!-- Service Topic -->
+        <param name="weights_topic"                 type="string"       value="$(arg weights_topic)" />
+        <param name="eval_topic"                    type="string"       value="$(arg eval_topic)" />
+        <!-- Publisher Topic -->
+        <param name="state_topic"                   type="string"       value="$(arg state_topic)" />
+        <!-- Subscriber Topic -->
+        <param name="rollouts_topic"                type="string"       value="$(arg rollouts_topic)" />
+    </node>
+
+    <!-- Env Node -->
+    <node pkg="ros_carla_rllib"     type="env_ppo"                         name="env_$(arg index)"
+          output="screen"           if="$(eval arg('type')=='env')" >
+        <!-- Environment -->
+        <param name="host"                          type="string"       value="$(arg host)" />
+        <param name="port"                          type="int"          value="$(arg port)" />
+        <param name="map"                           type="string"       value="$(arg map)" />
+        <param name="sync_mode"                     type="bool"         value="$(arg sync_mode)" />
+        <param name="delta_sec"                     type="double"       value="$(arg delta_sec)" />
+        <param name="scenario"                      type="string"       value="$(arg scenario)" />
+        <param name="frame_skip"                    type="int"          value="$(arg frame_skip)" />
+        <param name="render"                        type="bool"         value="$(arg render)" />
+        <param name="agent_type"                    type="string"       value="$(arg agent_type)" />
+        <param name="reset_info"                    type="string"       value="$(arg reset_info)" />
+        <!-- Trajectory Planning -->
+        <param name="deltaT"                        type="double"       value="$(arg deltaT)" />
+        <param name="dt"                            type="double"       value="$(arg dt)" />
+        <param name="fraction"                      type="double"       value="$(arg fraction)" />
+        <param name="dV_amp"                        type="double"       value="$(arg dV_amp)" />
+        <param name="dL_amp"                        type="double"       value="$(arg dL_amp)" />
+        <!-- Training -->
+        <param name="lambda"                        type="double"       value="$(arg lambda)" />
+        <param name="gamma"                         type="double"       value="$(arg gamma)" />
+        <param name="coop_factor"                   type="double"       value="$(arg coop_factor)" />
+        <param name="policy"                        type="string"       value="$(arg policy)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="verbose"                       type="bool"         value="$(arg verbose)" />
+        <!-- Service Topic -->
+        <param name="weights_topic"                 type="string"       value="$(arg weights_topic)" />
+        <!-- Publisher Topic -->
+        <param name="rollouts_topic"                type="string"       value="$(arg rollouts_topic)" />
+        <!-- Subscriber Topic -->
+        <param name="state_topic"                   type="string"       value="$(arg state_topic)" />
+    </node>
+
+    <!-- Evaluation Node -->
+    <node pkg="ros_carla_rllib"     type="evaluation"                      name="evaluation"
+          output="screen"           if="$(eval arg('type')=='eval')" >
+        <!-- Environment -->
+        <param name="host"                          type="string"       value="$(arg host)" />
+        <param name="port"                          type="int"          value="$(arg port)" />
+        <param name="map"                           type="string"       value="$(arg map)" />
+        <param name="sync_mode"                     type="bool"         value="$(arg sync_mode)" />
+        <param name="delta_sec"                     type="double"       value="$(arg delta_sec)" />
+        <param name="scenario"                      type="string"       value="$(arg scenario)" />
+        <param name="frame_skip"                    type="int"          value="$(arg frame_skip)" />
+        <param name="render"                        type="bool"         value="$(arg render)" />
+        <param name="agent_type"                    type="string"       value="$(arg agent_type)" />
+        <param name="reset_info"                    type="string"       value="$(arg reset_info)" />
+        <!-- Trajectory Planning -->
+        <param name="deltaT"                        type="double"       value="$(arg deltaT)" />
+        <param name="dt"                            type="double"       value="$(arg dt)" />
+        <param name="fraction"                      type="double"       value="$(arg fraction)" />
+        <param name="dV_amp"                        type="double"       value="$(arg dV_amp)" />
+        <param name="dL_amp"                        type="double"       value="$(arg dL_amp)" />
+        <!-- Evaluation -->
+        <param name="coop_factor"                   type="double"       value="$(arg coop_factor)" />
+        <param name="repetitions"                   type="int"          value="$(arg repetitions)" />
+        <param name="policy"                        type="string"       value="$(arg policy)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="save_path"                     type="string"       value="$(arg save_path)" />
+        <param name="verbose"                       type="bool"         value="$(arg verbose)" />
+        <!-- Service Topic -->
+        <param name="eval_topic"                    type="string"       value="$(arg eval_topic)" />
+    </node>
+
+</launch>

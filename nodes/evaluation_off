@@ -1,0 +1,356 @@
+#!/usr/bin/env python
+"""Offline Evaluation Node
+
+This script provides a ROS Node that evaluates checkpoints.
+
+Class:
+    * EvalNode - ROS node for offline evaluation
+"""
+import os
+import json
+import rospy
+import socket
+import importlib
+import numpy as np
+import torch
+from carla_rllib.environments.carla_envs.config import BaseConfig
+from carla_rllib.environments.carla_envs.trajectory_env import make_env
+from carla_rllib.utils.trajectory_planning import PolynomialGenerator
+
+from ros_carla_rllib.srv import RunEvaluation
+from ros_carla_rllib.srv import RunEvaluationResponse
+from ros_carla_rllib.policies import ActorCritic
+
+
+class EvalNode(object):
+    """
+    Evaluation node to evaluate checkpoints.
+    """
+
+    def __init__(self):
+
+        self.initialized = False
+        self.env = None
+        self.policy = None
+        self.generator = None
+
+        # Initialize
+        self.initialize_node()
+        self.get_parameter_values()
+        self.initialize_env()
+        self.initialize_policy()
+
+        self.initialized = True
+        print("Node is running")
+
+    def initialize_node(self):
+        """ """
+        rospy.init_node('eval_node_' + socket.gethostname().split('-')[-1])
+        print('Evaluation Node on ' + socket.gethostname() + ' initialized')
+
+    def get_parameter_values(self):
+        """ """
+        # Environment Parameters
+        self.host = rospy.get_param('~host', "localhost")
+        self.port = rospy.get_param('~port', 6379)
+        self.map = rospy.get_param('~map', "Town06")
+        self.sync_mode = rospy.get_param('~sync_mode', True)
+        self.delta_sec = rospy.get_param('~delta_sec', 0.1)
+        self.scenario = rospy.get_param('~scenario', "")
+        self.frame_skip = rospy.get_param('~frame_skip', 0)
+        self.render = rospy.get_param('~render', False)
+        self.agent_type = rospy.get_param('~agent_type', "discrete")
+        self.reset_info = rospy.get_param('~reset_info', "")
+        # Trajectory Planning
+        self.deltaT = rospy.get_param('~deltaT', 1.0)
+        self.dt = rospy.get_param('~dt', 0.05)
+        self.fraction = rospy.get_param('~fraction', 0.25)
+        self.dV_amp = rospy.get_param('~dV_amp', 3.5)
+        self.dL_amp = rospy.get_param('~dL_amp', 1.75)
+        # Evaluation
+        self.coop_factor = rospy.get_param('~coop_factor', 0.0)
+        self.repetitions = rospy.get_param('~repetitions', 100)
+        self.policy_n = rospy.get_param('~policy', "gaussian")
+        self.model = rospy.get_param('~model', "")
+        self.checkpoint = rospy.get_param('~checkpoint', "")
+
+    def initialize_env(self):
+        """Creates the CARLA environment"""
+        class Config:
+            pass
+        config = Config()
+        config.host = self.host
+        config.port = self.port
+        config.map = self.map
+        config.sync_mode = self.sync_mode
+        config.delta_sec = self.delta_sec
+        config.no_rendering_mode = not self.render
+        config.scenario = self.scenario
+        config.frame_skip = self.frame_skip
+        config.render = self.render
+        config.stable_baselines = False
+        config.agent_type = self.agent_type
+        config.coop_factor = self.coop_factor
+        config.camera_settings = {"enabled": False, "type_id": None}
+        with open(os.path.expanduser(self.reset_info), "r") as f:
+            self.reset_info = json.load(f)
+        config.reset_info = self.reset_info
+        config.eval = True
+        self.env = make_env(config)
+        self.generator = PolynomialGenerator(
+            deltaT=self.deltaT, dt=self.dt, fraction=self.fraction)
+        print("Environment initialized")
+
+    def initialize_policy(self):
+        """Creates policy"""
+        self.policy = ActorCritic(self.model, self.policy_n)
+        print("Policy initialized")
+
+    def run_episode(self):
+        """Runs an evaluation episode in the CARLA environment
+
+        - Executes environment steps
+        - Collects evaluation statistics
+        """
+        print("----------Episode " + str(self.eval_run) + " is running----------")
+        # Simulate environment while not terminal
+        frames = 0
+        terminal = False
+        obs_dict = self.env.reset()
+        while not terminal and not rospy.is_shutdown():
+
+            frames += 1
+
+            # Get actions
+            action_dict, value_dict = self.get_action(obs_dict)
+            # Execute environment step
+            next_obs_dict, reward_dict, done_dict, info_dict = self.env.step(
+                action_dict)
+            # Check if episode is done
+            if any(d != 0 for d in done_dict.values()):
+                if frames == 1:
+                    return False
+                terminal = True
+            # Calculate trajectories
+            traj_dict = self.get_trajectory(action_dict)
+            # Store metrics
+            self.store_metrics(action_dict["Agent_1"], traj_dict["Agent_1"], reward_dict["Agent_1"],
+                                done_dict["Agent_1"], frames, self.env.agents[0].state.v_desire)
+
+            obs_dict = next_obs_dict
+
+        return True
+
+    def run_evaluation(self):
+        """Runs the evaluation of a checkpoint"""
+        print("Run checkpoint evaluation")
+        # Load checkpoint
+        self.load_weights()
+        # Run multiple episodes
+        self.reset_metrics()
+        self.scenario_counter = 0
+        for world, scenarios in self.reset_info.items():
+
+            if rospy.is_shutdown():
+                break
+
+            for scenario in scenarios.keys():
+                self.env.switch_world(str(world), str(scenario))
+                print("Run Evaluation for " + str(world) + ":" + str(scenario))
+                for episode in range(self.repetitions):
+                    # Run evaluation episode
+                    success = False
+                    while not success:
+                        success = self.run_episode()
+
+                    if rospy.is_shutdown():
+                        break
+
+                if rospy.is_shutdown():
+                    break
+
+                self.scenario_counter += 1
+                self.eval_run = 0
+
+        self.save_metrics()
+
+    def reset_metrics(self):
+        """ """
+        self.dV = -99. * np.ones((4, 100, 150), dtype=np.float32)
+        self.dL = -99. * np.ones((4, 100, 150), dtype=np.float32)
+        self.x = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.y = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.vx = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.vy = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.ax = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.ay = -99. * np.ones((4, 100, 600), dtype=np.float32)
+        self.heading = -99. * np.ones((4, 100, 600), dtype=np.float32)
+
+        self.reward = np.zeros((4, 100, 150), dtype=np.float32)
+        self.distance_reward = np.zeros((4, 100, 150), dtype=np.float32)
+        self.speed_reward = np.zeros((4, 100, 150), dtype=np.float32)
+        self.heading_reward = np.zeros((4, 100, 150), dtype=np.float32)
+        self.length = np.zeros((4, 150), dtype=np.float32)
+        self.terminal = np.zeros((4, 150), dtype=np.float32)
+        self.v_desire = np.zeros((4, 150), dtype=np.float32)
+
+        self.time_step = 0
+        self.action = 0
+        self.eval_run = 0
+
+    def store_metrics(self, action, trajectory, reward, done, length, v_desire):
+        """Stores evaluation metrics"""
+
+        # Action
+        for step in range(1, trajectory.t_steps):
+            # Position
+            self.x[self.scenario_counter][self.eval_run][self.time_step] = trajectory.s_coordinates[step]
+            self.y[self.scenario_counter][self.eval_run][self.time_step] = trajectory.d_coordinates[step]
+            # Velocity
+            self.vx[self.scenario_counter][self.eval_run][self.time_step] = trajectory.s_velocity[step]
+            self.vy[self.scenario_counter][self.eval_run][self.time_step] = trajectory.d_velocity[step]
+            # Acceleration
+            self.ax[self.scenario_counter][self.eval_run][self.time_step] = trajectory.s_acceleration[step]
+            self.ay[self.scenario_counter][self.eval_run][self.time_step] = trajectory.d_acceleration[step]
+            # Heading
+            self.heading[self.scenario_counter][self.eval_run][self.time_step] = trajectory.get_angle(step)
+
+            self.time_step += 1
+
+        # Reward
+        self.reward[self.scenario_counter][self.eval_run][self.action] = reward[0]
+        self.distance_reward[self.scenario_counter][self.eval_run][self.action] = reward[1]
+        self.speed_reward[self.scenario_counter][self.eval_run][self.action] = reward[2]
+        self.heading_reward[self.scenario_counter][self.eval_run][self.action] = reward[3]
+
+        # Actions
+        self.dV[self.scenario_counter][self.eval_run][self.action] = action[0]
+        self.dL[self.scenario_counter][self.eval_run][self.action] = action[1]
+
+        self.action += 1
+
+        if done:
+            self.terminal[self.scenario_counter][self.eval_run] = done
+            self.length[self.scenario_counter][self.eval_run] = length - 1
+            self.v_desire[self.scenario_counter][self.eval_run] = v_desire
+            self.eval_run += 1
+            self.action = 0
+            self.time_step = 0
+
+    def save_metrics(self):
+        """Save metrics on disk"""
+
+        dir_ = os.path.dirname(os.path.expanduser(self.checkpoint))
+        split = os.path.split(dir_)[-1]
+        filename = os.path.join(dir_, split + "_evaluation.npz")
+        np.savez(filename, x=self.x, y=self.y,
+                vx=self.vx, vy=self.vy,
+                ax=self.ax, ay=self.ay,
+                heading=self.heading,
+                v_desire=self.v_desire,
+                reward=self.reward,
+                distance_reward=self.distance_reward,
+                speed_reward=self.speed_reward,
+                heading_reward=self.heading_reward,
+                dV=self.dV,
+                dL=self.dL,
+                length=self.length,
+                terminal=self.terminal)
+
+    def get_action(self, obs_dict):
+        """Returns action and state value"""
+        action_dict = dict()
+        value_dict = dict()
+        for agent in self.env.agents:
+            # Preprocess observations
+            obs = obs_dict[agent.id]
+            obs_tensor = self.preprocess_obs(obs)
+            # Predict (deterministic) action and state value
+            action, value = self.policy.act(obs_tensor)
+            # Clip action to valid range
+            if self.policy_n == "gaussian":
+                deltaV = np.clip(action, -self.dV_amp, self.dV_amp)[0][0]
+                deltaD = np.clip(action, -self.dL_amp, self.dL_amp)[0][1]
+            elif self.policy_n == "beta":
+                deltaV = -self.dV_amp + (2 * self.dV_amp) * action[0][0]
+                deltaD = -self.dL_amp + (2 * self.dL_amp) * action[0][1]
+            action_dict[agent.id] = [deltaV, deltaD]
+            value_dict[agent.id] = value
+
+        return action_dict, value_dict
+
+    def get_trajectory(self, action_dict):
+        """Transforms action to maneuver
+
+        This calculation is adapted to the CARLA coordinate system.
+        There might be weird behavior if the road in CARLA is not straight.
+        """
+        traj_dict = {}
+        for agent in self.env.agents:
+
+            # Get state and action
+            position = agent.state.position
+            velocity = agent.state.xy_velocity
+            acceleration = agent.state.xy_acceleration
+            rotation = agent.state.direction_heading
+            action = action_dict[agent.id]
+
+            # Calculate trajectory
+            # s-axis == x-axis in carla
+            # d-axis == -1.0 * y-axis in carla
+            trajectory = self.generator.calculate_trajectory(position=position, velocity=velocity, acceleration=acceleration,
+                                                             deltaV=action[0], deltaD=-1.0 * action[1])
+            # Correct road twist
+            theta = np.radians(rotation)
+            trajectory = self.generator.transform_trajectory(trajectory, theta)
+            traj_dict[agent.id] = trajectory
+
+        return traj_dict
+
+    def preprocess_obs(self, obs):
+        """Transforms observations into torch.Tensors"""
+        # Add batch dimensions
+        xV = np.expand_dims(obs[0], 0)
+        xE = [obs[1]]
+        xO = np.expand_dims(obs[2], 0)
+        xO = xO - np.zeros_like(xO)
+
+        # All: Convert arrays to torch.Tensor
+        obs_tensors = []
+        obs_tensors.append(torch.from_numpy(xV).float())
+        obs_tensors.append(torch.Tensor(xE).float())
+        obs_tensors.append(torch.from_numpy(xO).float())
+
+        return obs_tensors
+
+    def load_weights(self):
+        """Loads model parameters"""
+        path = os.path.expanduser(self.checkpoint)
+        checkpoint = torch.load(path)
+        self.policy.pi.load_state_dict(checkpoint["pi"])
+        self.policy.value_fn.load_state_dict(checkpoint["vf"])
+        self.policy.pi.eval()
+        self.policy.value_fn.eval()
+        print("Checkpoint loaded: " + path)
+
+    def is_initialized(self):
+        """ """
+        return self.initialized
+
+    def quit(self):
+        """Closes the environment"""
+        try:
+            self.env.close()
+        except:
+            pass
+        print('Evaluation Node quited')
+
+
+if __name__ == '__main__':
+
+    node = EvalNode()
+    try:
+        if not rospy.is_shutdown() and node.is_initialized():
+            node.run_evaluation()
+    finally:
+        node.quit()

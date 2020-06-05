@@ -1,0 +1,54 @@
+<launch>
+
+    <!-- Environment Parameters -->
+    <arg name="host"                            default="localhost" />
+    <arg name="port"                            default="6379" />
+    <arg name="map"                             default="two_lane_road" />
+    <arg name="sync_mode"                       default="true" />
+    <arg name="delta_sec"                       default="0.05" />
+    <arg name="scenario"                        default="test_1" />
+    <arg name="frame_skip"                      default="0" />
+    <arg name="render"                          default="false" />
+    <arg name="agent_type"                      default="discrete" />
+    <arg name="reset_info"                      default="~/no_backup/carla_reset_info/solo_final_evaluation.json" />
+
+    <!-- Trajectory Planning -->
+    <arg name="deltaT"				            default="1.0" />
+    <arg name="dt"				                default="0.05" />
+    <arg name="fraction"				        default="0.25" />
+    <arg name="dV_amp"				            default="3.5" />
+    <arg name="dL_amp"				            default="1.75" />
+
+    <!-- Evaluation Parameters -->
+    <arg name="repetitions"                     default="100" />
+    <arg name="checkpoint"                      default="~/no_backup/Training/solo/Training_102/best_checkpoint.pt" />
+    <arg name="model"                           default="SoloPPO3" />
+    <arg name="coop_factor"                     default="0.0" />
+
+    <!-- Evaluation Node -->
+    <node pkg="ros_carla_rllib"     type="evaluation_off"     name="evaluation"     output="screen" >
+        <!-- Environment -->
+        <param name="host"                          type="string"       value="$(arg host)" />
+        <param name="port"                          type="int"          value="$(arg port)" />
+        <param name="map"                           type="string"       value="$(arg map)" />
+        <param name="sync_mode"                     type="bool"         value="$(arg sync_mode)" />
+        <param name="delta_sec"                     type="double"       value="$(arg delta_sec)" />
+        <param name="scenario"                      type="string"       value="$(arg scenario)" />
+        <param name="frame_skip"                    type="int"          value="$(arg frame_skip)" />
+        <param name="render"                        type="bool"         value="$(arg render)" />
+        <param name="agent_type"                    type="string"       value="$(arg agent_type)" />
+        <param name="reset_info"                    type="string"       value="$(arg reset_info)" />
+        <!-- Trajectory Planning -->
+        <param name="deltaT"                        type="double"       value="$(arg deltaT)" />
+        <param name="dt"                            type="double"       value="$(arg dt)" />
+        <param name="fraction"                      type="double"       value="$(arg fraction)" />
+        <param name="dV_amp"                        type="double"       value="$(arg dV_amp)" />
+        <param name="dL_amp"                        type="double"       value="$(arg dL_amp)" />
+        <!-- Evaluation -->
+        <param name="repetitions"                   type="int"          value="$(arg repetitions)" />
+        <param name="model"                         type="string"       value="$(arg model)" />
+        <param name="checkpoint"                    type="string"       value="$(arg checkpoint)" />
+        <param name="coop_factor"                   type="double"       value="$(arg coop_factor)" />
+    </node>
+
+</launch>
