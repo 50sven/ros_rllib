@@ -12,16 +12,20 @@ To get started with the CARLA reinforcment learning library, click
 
 ## Prerequisites
 
-1\. Follow the instructions [here](http://wiki.ros.org/ROS/Tutorials/catkin/CreateWorkspace) to create a catkin workspace.
+1\. Install [NumPy](https://numpy.org/) and [PyTorch](https://pytorch.org/).
 
-2\. Clone this repository into the `src` folder of your catkin workspace:
+2\. Follow the instructions [here](http://wiki.ros.org/melodic/Installation) to install ROS melodic.
+
+3\. Follow the instructions [here](http://wiki.ros.org/ROS/Tutorials/catkin/CreateWorkspace) to create a catkin workspace.
+
+4\. Clone this repository into the `src` folder of your catkin workspace:
 
 ```bash
 cd catkin_ws/src
 git clone https://github.com/50sven/ros_rl.git
 ```
 
-3\. Build your package with `catkin_make`:
+5\. Build your package with `catkin_make`:
 
 ```bash
 cd catkin_ws
